@@ -1,0 +1,863 @@
+import json
+import re
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
+from app.db import (
+    get_chat_db,
+    get_contacts_db,
+    get_lid_db,
+    refresh_db,
+    apple_ts_to_datetime,
+    datetime_to_apple_ts,
+    format_dt,
+)
+
+# LID to phone/name cache (populated on first use)
+_lid_cache: dict[str, dict] = {}
+_lid_cache_loaded = False
+
+
+def _is_readable_text(text: Optional[str]) -> bool:
+    """Check if text looks like real readable text (not binary/protobuf)."""
+    if not text:
+        return False
+    # If it's mostly printable and doesn't look like base64/binary
+    non_printable = sum(1 for c in text if ord(c) > 127 and not _is_emoji_char(c))
+    if len(text) > 10 and non_printable / len(text) > 0.3:
+        return False
+    return True
+
+
+def _is_emoji_char(c: str) -> bool:
+    """Rough check for emoji/unicode characters that are valid in messages."""
+    cp = ord(c)
+    return cp > 0x1F000 or (0x2600 <= cp <= 0x27BF) or (0xFE00 <= cp <= 0xFEFF)
+
+
+def _clean_sender(name: Optional[str]) -> Optional[str]:
+    """Clean up sender name — filter out binary-looking values."""
+    if not name:
+        return None
+    # Base64-ish or binary data
+    if re.match(r'^[A-Za-z0-9+/=]{3,}$', name) and '=' in name:
+        return None
+    return name
+
+# ---------------------------------------------------------------------------
+# Message type labels
+# ---------------------------------------------------------------------------
+MESSAGE_TYPES = {
+    0: "text",
+    1: "image",
+    2: "video",
+    3: "voice_note",
+    4: "contact",
+    5: "location",
+    6: "system",
+    7: "link",
+    8: "document",
+    10: "deleted",
+    14: "deleted_by_admin",
+    15: "sticker",
+}
+
+
+# ---------------------------------------------------------------------------
+# Tool definitions (OpenAI function-calling format)
+# ---------------------------------------------------------------------------
+TOOL_DEFINITIONS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_contacts",
+            "description": (
+                "Search WhatsApp contacts by name or phone number. "
+                "Returns matching contacts with their JID (unique identifier), "
+                "display name, and phone number. Use this to find a contact "
+                "before reading their messages. If multiple matches are found, "
+                "present the options to the user to choose."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Name or phone number to search for (partial match supported)",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_recent_chats",
+            "description": (
+                "List recent WhatsApp chats/conversations ordered by last message time. "
+                "Shows chat name, type (DM or group), unread count, and last message preview. "
+                "Use this to get an overview of recent conversations."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of chats to return (default 20, max 50)",
+                        "default": 20,
+                    },
+                    "chat_type": {
+                        "type": "string",
+                        "enum": ["all", "dm", "group"],
+                        "description": "Filter by chat type: 'dm' for direct messages, 'group' for groups, 'all' for both (default: all)",
+                        "default": "all",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_messages",
+            "description": (
+                "Get messages from a specific WhatsApp chat. Supports filtering by date range. "
+                "The chat_jid parameter is the unique identifier for the chat — get it from "
+                "search_contacts or list_recent_chats first. "
+                "Messages are returned in chronological order. "
+                "If you need older messages, call again with an earlier 'before' date. "
+                "If the conversation seems to start abruptly, fetch earlier messages to get full context."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat_jid": {
+                        "type": "string",
+                        "description": "The JID of the chat (e.g., '919876543210@s.whatsapp.net' for DM, '120363...@g.us' for group)",
+                    },
+                    "after": {
+                        "type": "string",
+                        "description": "Only messages after this datetime (ISO 8601 format, e.g., '2025-02-01T00:00:00'). Defaults to 24 hours ago.",
+                    },
+                    "before": {
+                        "type": "string",
+                        "description": "Only messages before this datetime (ISO 8601 format). Defaults to now.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max messages to return (default 50, max 200)",
+                        "default": 50,
+                    },
+                    "search_text": {
+                        "type": "string",
+                        "description": "Optional text to search for within messages (case-insensitive)",
+                    },
+                },
+                "required": ["chat_jid"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_group_info",
+            "description": (
+                "Get details about a WhatsApp group including its members, "
+                "creation date, and admin list. The chat_jid must be a group JID "
+                "(ending in @g.us)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat_jid": {
+                        "type": "string",
+                        "description": "The group JID (e.g., '120363...@g.us')",
+                    }
+                },
+                "required": ["chat_jid"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_messages",
+            "description": (
+                "Search for messages containing specific text across all chats or within a specific chat. "
+                "Useful for finding when something was discussed. Returns messages with chat context."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Text to search for in message content (case-insensitive)",
+                    },
+                    "chat_jid": {
+                        "type": "string",
+                        "description": "Optional: limit search to a specific chat JID",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (default 20, max 50)",
+                        "default": 20,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_starred_messages",
+            "description": (
+                "Get starred/important messages, optionally filtered by chat. "
+                "Starred messages are ones the user has marked as important."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat_jid": {
+                        "type": "string",
+                        "description": "Optional: limit to starred messages in a specific chat",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (default 20)",
+                        "default": 20,
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_chat_statistics",
+            "description": (
+                "Get statistics about a chat: total message count, messages per participant, "
+                "date range, media counts, etc. Useful for understanding chat activity."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat_jid": {
+                        "type": "string",
+                        "description": "The JID of the chat to get statistics for",
+                    }
+                },
+                "required": ["chat_jid"],
+            },
+        },
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Tool implementations
+# ---------------------------------------------------------------------------
+
+
+def search_contacts(query: str) -> str:
+    """Search contacts by name or phone number."""
+    results = []
+
+    # Search in ContactsV2 database
+    try:
+        conn = get_contacts_db()
+        cursor = conn.execute(
+            """
+            SELECT ZWHATSAPPID, ZFULLNAME, ZPHONENUMBER, ZABOUTTEXT, ZPHONENUMBERLABEL
+            FROM ZWAADDRESSBOOKCONTACT
+            WHERE (ZFULLNAME LIKE ? OR ZPHONENUMBER LIKE ? OR ZWHATSAPPID LIKE ?)
+            AND ZWHATSAPPID IS NOT NULL
+            ORDER BY ZFULLNAME
+            LIMIT 20
+            """,
+            (f"%{query}%", f"%{query}%", f"%{query}%"),
+        )
+        for row in cursor:
+            results.append(
+                {
+                    "jid": f"{row['ZWHATSAPPID']}@s.whatsapp.net" if row["ZWHATSAPPID"] and "@" not in row["ZWHATSAPPID"] else row["ZWHATSAPPID"],
+                    "name": row["ZFULLNAME"],
+                    "phone": row["ZPHONENUMBER"],
+                    "about": row["ZABOUTTEXT"],
+                }
+            )
+        conn.close()
+    except Exception:
+        pass
+
+    # Also search in chat sessions for names not in contacts
+    try:
+        conn = get_chat_db()
+        cursor = conn.execute(
+            """
+            SELECT ZCONTACTJID, ZPARTNERNAME
+            FROM ZWACHATSESSION
+            WHERE ZPARTNERNAME LIKE ? AND ZREMOVED = 0
+            ORDER BY ZLASTMESSAGEDATE DESC
+            LIMIT 20
+            """,
+            (f"%{query}%",),
+        )
+        existing_jids = {r["jid"] for r in results}
+        for row in cursor:
+            jid = row["ZCONTACTJID"]
+            if jid and jid not in existing_jids:
+                is_group = "@g.us" in jid if jid else False
+                results.append(
+                    {
+                        "jid": jid,
+                        "name": row["ZPARTNERNAME"],
+                        "phone": None,
+                        "type": "group" if is_group else "contact",
+                    }
+                )
+        conn.close()
+    except Exception:
+        pass
+
+    if not results:
+        return json.dumps({"matches": [], "message": f"No contacts found matching '{query}'"})
+
+    return json.dumps({"matches": results, "count": len(results)})
+
+
+def list_recent_chats(limit: int = 20, chat_type: str = "all") -> str:
+    """List recent chats ordered by last message time."""
+    limit = min(limit, 50)
+    conn = get_chat_db()
+
+    type_filter = ""
+    if chat_type == "dm":
+        type_filter = "AND c.ZSESSIONTYPE = 0"
+    elif chat_type == "group":
+        type_filter = "AND c.ZSESSIONTYPE = 1"
+
+    # Use a subquery to get the actual latest message date and text from ZWAMESSAGE
+    # because ZLASTMESSAGEDATE can have corrupted values for some chats
+    cursor = conn.execute(
+        f"""
+        SELECT c.ZCONTACTJID, c.ZPARTNERNAME, c.ZSESSIONTYPE, c.ZUNREADCOUNT,
+               latest.msg_text, latest.msg_date
+        FROM ZWACHATSESSION c
+        LEFT JOIN (
+            SELECT ZCHATSESSION,
+                   MAX(ZMESSAGEDATE) as msg_date,
+                   ZTEXT as msg_text
+            FROM ZWAMESSAGE
+            WHERE ZMESSAGETYPE IN (0, 1, 2, 3, 7, 8, 15)
+            GROUP BY ZCHATSESSION
+        ) latest ON latest.ZCHATSESSION = c.Z_PK
+        WHERE c.ZREMOVED = 0
+          AND c.ZSESSIONTYPE IN (0, 1)
+          AND latest.msg_date IS NOT NULL
+          {type_filter}
+        ORDER BY latest.msg_date DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+
+    chats = []
+    for row in cursor:
+        last_dt = apple_ts_to_datetime(row["msg_date"])
+        if last_dt is None:
+            continue
+        last_msg = row["msg_text"]
+        if not _is_readable_text(last_msg):
+            last_msg = None
+        chats.append(
+            {
+                "jid": row["ZCONTACTJID"],
+                "name": row["ZPARTNERNAME"],
+                "type": "group" if row["ZSESSIONTYPE"] == 1 else "dm",
+                "unread_count": row["ZUNREADCOUNT"] or 0,
+                "last_message": last_msg,
+                "last_message_time": format_dt(last_dt),
+            }
+        )
+    conn.close()
+    return json.dumps({"chats": chats, "count": len(chats)})
+
+
+def get_messages(
+    chat_jid: str,
+    after: Optional[str] = None,
+    before: Optional[str] = None,
+    limit: int = 50,
+    search_text: Optional[str] = None,
+) -> str:
+    """Get messages from a specific chat with date filters."""
+    limit = min(limit, 200)
+    now = datetime.now(tz=timezone.utc)
+
+    # Parse date filters
+    if after:
+        try:
+            after_dt = datetime.fromisoformat(after.replace("Z", "+00:00"))
+            if after_dt.tzinfo is None:
+                after_dt = after_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            after_dt = now - timedelta(hours=24)
+    else:
+        after_dt = now - timedelta(hours=24)
+
+    if before:
+        try:
+            before_dt = datetime.fromisoformat(before.replace("Z", "+00:00"))
+            if before_dt.tzinfo is None:
+                before_dt = before_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            before_dt = now
+    else:
+        before_dt = now
+
+    after_apple = datetime_to_apple_ts(after_dt)
+    before_apple = datetime_to_apple_ts(before_dt)
+
+    conn = get_chat_db()
+
+    # Get chat info
+    chat_row = conn.execute(
+        "SELECT ZPARTNERNAME, ZSESSIONTYPE FROM ZWACHATSESSION WHERE ZCONTACTJID = ?",
+        (chat_jid,),
+    ).fetchone()
+
+    chat_name = chat_row["ZPARTNERNAME"] if chat_row else "Unknown"
+    is_group = chat_row["ZSESSIONTYPE"] == 1 if chat_row else False
+
+    # Build query
+    text_filter = ""
+    params = [chat_jid, after_apple, before_apple]
+    if search_text:
+        text_filter = "AND m.ZTEXT LIKE ?"
+        params.append(f"%{search_text}%")
+    params.append(limit)
+
+    cursor = conn.execute(
+        f"""
+        SELECT m.ZTEXT, m.ZISFROMME, m.ZMESSAGEDATE, m.ZMESSAGETYPE,
+               m.ZFROMJID, m.ZSTARRED, m.ZPUSHNAME,
+               gm.ZMEMBERJID, gm.ZCONTACTNAME
+        FROM ZWAMESSAGE m
+        JOIN ZWACHATSESSION c ON m.ZCHATSESSION = c.Z_PK
+        LEFT JOIN ZWAGROUPMEMBER gm ON m.ZGROUPMEMBER = gm.Z_PK
+        WHERE c.ZCONTACTJID = ?
+          AND m.ZMESSAGEDATE >= ?
+          AND m.ZMESSAGEDATE <= ?
+          {text_filter}
+        ORDER BY m.ZMESSAGEDATE ASC
+        LIMIT ?
+        """,
+        params,
+    )
+
+    messages = []
+    for row in cursor:
+        msg_dt = apple_ts_to_datetime(row["ZMESSAGEDATE"])
+        msg_type = MESSAGE_TYPES.get(row["ZMESSAGETYPE"], f"type_{row['ZMESSAGETYPE']}")
+
+        push_name = _clean_sender(row["ZPUSHNAME"])
+        # For group messages, try group member info first
+        member_name = None
+        if is_group and not row["ZISFROMME"]:
+            member_jid = row["ZMEMBERJID"] if "ZMEMBERJID" in row.keys() else None
+            contact_name = row["ZCONTACTNAME"] if "ZCONTACTNAME" in row.keys() else None
+            if contact_name and _is_readable_text(contact_name):
+                member_name = contact_name
+            elif member_jid:
+                member_name = _jid_to_name(member_jid)
+        sender = "You" if row["ZISFROMME"] else (member_name or push_name or _jid_to_name(row["ZFROMJID"]) or "them")
+
+        # Skip system messages with binary content
+        text = row["ZTEXT"]
+        if msg_type == "system" and text and not _is_readable_text(text):
+            continue
+
+        msg = {
+            "time": format_dt(msg_dt),
+            "sender": sender,
+            "type": msg_type,
+            "starred": bool(row["ZSTARRED"]),
+        }
+        if text and _is_readable_text(text):
+            msg["text"] = text
+        elif msg_type != "text":
+            msg["text"] = f"[{msg_type}]"
+        else:
+            msg["text"] = ""
+
+        messages.append(msg)
+
+    conn.close()
+
+    return json.dumps(
+        {
+            "chat_name": chat_name,
+            "chat_jid": chat_jid,
+            "chat_type": "group" if is_group else "dm",
+            "time_range": {
+                "after": format_dt(after_dt),
+                "before": format_dt(before_dt),
+            },
+            "messages": messages,
+            "count": len(messages),
+            "has_more": len(messages) == limit,
+        }
+    )
+
+
+def get_group_info(chat_jid: str) -> str:
+    """Get group details including members."""
+    conn = get_chat_db()
+
+    # Get group session
+    chat = conn.execute(
+        """
+        SELECT c.Z_PK, c.ZPARTNERNAME, c.ZSESSIONTYPE, c.ZLASTMESSAGEDATE
+        FROM ZWACHATSESSION c
+        WHERE c.ZCONTACTJID = ?
+        """,
+        (chat_jid,),
+    ).fetchone()
+
+    if not chat:
+        conn.close()
+        return json.dumps({"error": f"Group not found: {chat_jid}"})
+
+    # Get group info
+    group_info = conn.execute(
+        """
+        SELECT g.ZCREATORJID, g.ZOWNERJID, g.ZCREATIONDATE
+        FROM ZWAGROUPINFO g
+        WHERE g.ZCHATSESSION = ?
+        """,
+        (chat["Z_PK"],),
+    ).fetchone()
+
+    # Get members
+    members_cursor = conn.execute(
+        """
+        SELECT ZMEMBERJID, ZCONTACTNAME, ZISADMIN, ZISACTIVE
+        FROM ZWAGROUPMEMBER
+        WHERE ZCHATSESSION = ?
+        ORDER BY ZCONTACTNAME
+        """,
+        (chat["Z_PK"],),
+    )
+
+    members = []
+    for m in members_cursor:
+        members.append(
+            {
+                "jid": m["ZMEMBERJID"],
+                "name": m["ZCONTACTNAME"] or _jid_to_name(m["ZMEMBERJID"]),
+                "is_admin": bool(m["ZISADMIN"]),
+                "is_active": bool(m["ZISACTIVE"]),
+            }
+        )
+
+    result = {
+        "name": chat["ZPARTNERNAME"],
+        "jid": chat_jid,
+        "member_count": len(members),
+        "members": members,
+    }
+
+    if group_info:
+        creation_dt = apple_ts_to_datetime(group_info["ZCREATIONDATE"])
+        result["created"] = format_dt(creation_dt)
+        result["creator"] = _jid_to_name(group_info["ZCREATORJID"])
+        result["owner"] = _jid_to_name(group_info["ZOWNERJID"])
+
+    conn.close()
+    return json.dumps(result)
+
+
+def search_messages(query: str, chat_jid: Optional[str] = None, limit: int = 20) -> str:
+    """Search messages by text content."""
+    limit = min(limit, 50)
+    conn = get_chat_db()
+
+    jid_filter = ""
+    params = [f"%{query}%"]
+    if chat_jid:
+        jid_filter = "AND c.ZCONTACTJID = ?"
+        params.append(chat_jid)
+    params.append(limit)
+
+    cursor = conn.execute(
+        f"""
+        SELECT m.ZTEXT, m.ZISFROMME, m.ZMESSAGEDATE, m.ZMESSAGETYPE,
+               m.ZFROMJID, m.ZPUSHNAME,
+               c.ZPARTNERNAME, c.ZCONTACTJID, c.ZSESSIONTYPE
+        FROM ZWAMESSAGE m
+        JOIN ZWACHATSESSION c ON m.ZCHATSESSION = c.Z_PK
+        WHERE m.ZTEXT LIKE ?
+          {jid_filter}
+        ORDER BY m.ZMESSAGEDATE DESC
+        LIMIT ?
+        """,
+        params,
+    )
+
+    results = []
+    for row in cursor:
+        msg_dt = apple_ts_to_datetime(row["ZMESSAGEDATE"])
+        sender = "You" if row["ZISFROMME"] else (row["ZPUSHNAME"] or _jid_to_name(row["ZFROMJID"]) or "them")
+        results.append(
+            {
+                "chat_name": row["ZPARTNERNAME"],
+                "chat_jid": row["ZCONTACTJID"],
+                "chat_type": "group" if row["ZSESSIONTYPE"] == 1 else "dm",
+                "sender": sender,
+                "text": row["ZTEXT"],
+                "time": format_dt(msg_dt),
+            }
+        )
+
+    conn.close()
+    return json.dumps({"query": query, "results": results, "count": len(results)})
+
+
+def get_starred_messages(chat_jid: Optional[str] = None, limit: int = 20) -> str:
+    """Get starred/important messages."""
+    limit = min(limit, 50)
+    conn = get_chat_db()
+
+    jid_filter = ""
+    params = []
+    if chat_jid:
+        jid_filter = "AND c.ZCONTACTJID = ?"
+        params.append(chat_jid)
+    params.append(limit)
+
+    cursor = conn.execute(
+        f"""
+        SELECT m.ZTEXT, m.ZISFROMME, m.ZMESSAGEDATE, m.ZMESSAGETYPE,
+               m.ZFROMJID, m.ZPUSHNAME,
+               c.ZPARTNERNAME, c.ZCONTACTJID
+        FROM ZWAMESSAGE m
+        JOIN ZWACHATSESSION c ON m.ZCHATSESSION = c.Z_PK
+        WHERE m.ZSTARRED = 1
+          {jid_filter}
+        ORDER BY m.ZMESSAGEDATE DESC
+        LIMIT ?
+        """,
+        params,
+    )
+
+    results = []
+    for row in cursor:
+        msg_dt = apple_ts_to_datetime(row["ZMESSAGEDATE"])
+        sender = "You" if row["ZISFROMME"] else (row["ZPUSHNAME"] or _jid_to_name(row["ZFROMJID"]) or "them")
+        results.append(
+            {
+                "chat_name": row["ZPARTNERNAME"],
+                "chat_jid": row["ZCONTACTJID"],
+                "sender": sender,
+                "text": row["ZTEXT"] or f"[{MESSAGE_TYPES.get(row['ZMESSAGETYPE'], 'media')}]",
+                "time": format_dt(msg_dt),
+        })
+
+    conn.close()
+    return json.dumps({"starred_messages": results, "count": len(results)})
+
+
+def get_chat_statistics(chat_jid: str) -> str:
+    """Get statistics about a chat."""
+    conn = get_chat_db()
+
+    chat = conn.execute(
+        "SELECT Z_PK, ZPARTNERNAME, ZSESSIONTYPE FROM ZWACHATSESSION WHERE ZCONTACTJID = ?",
+        (chat_jid,),
+    ).fetchone()
+
+    if not chat:
+        conn.close()
+        return json.dumps({"error": f"Chat not found: {chat_jid}"})
+
+    chat_pk = chat["Z_PK"]
+
+    # Total messages
+    total = conn.execute(
+        "SELECT COUNT(*) as cnt FROM ZWAMESSAGE WHERE ZCHATSESSION = ?",
+        (chat_pk,),
+    ).fetchone()["cnt"]
+
+    # Sent vs received
+    sent = conn.execute(
+        "SELECT COUNT(*) as cnt FROM ZWAMESSAGE WHERE ZCHATSESSION = ? AND ZISFROMME = 1",
+        (chat_pk,),
+    ).fetchone()["cnt"]
+
+    # Date range
+    date_range = conn.execute(
+        "SELECT MIN(ZMESSAGEDATE) as earliest, MAX(ZMESSAGEDATE) as latest FROM ZWAMESSAGE WHERE ZCHATSESSION = ?",
+        (chat_pk,),
+    ).fetchone()
+
+    # Message types breakdown
+    type_cursor = conn.execute(
+        "SELECT ZMESSAGETYPE, COUNT(*) as cnt FROM ZWAMESSAGE WHERE ZCHATSESSION = ? GROUP BY ZMESSAGETYPE ORDER BY cnt DESC",
+        (chat_pk,),
+    )
+    type_breakdown = {}
+    for row in type_cursor:
+        label = MESSAGE_TYPES.get(row["ZMESSAGETYPE"], f"type_{row['ZMESSAGETYPE']}")
+        type_breakdown[label] = row["cnt"]
+
+    # Top senders (for groups)
+    top_senders = []
+    if chat["ZSESSIONTYPE"] == 1:
+        sender_cursor = conn.execute(
+            """
+            SELECT ZPUSHNAME, ZFROMJID, COUNT(*) as cnt
+            FROM ZWAMESSAGE
+            WHERE ZCHATSESSION = ? AND ZISFROMME = 0
+            GROUP BY ZFROMJID
+            ORDER BY cnt DESC
+            LIMIT 10
+            """,
+            (chat_pk,),
+        )
+        for row in sender_cursor:
+            top_senders.append(
+                {
+                    "name": row["ZPUSHNAME"] or _jid_to_name(row["ZFROMJID"]),
+                    "message_count": row["cnt"],
+                }
+            )
+
+    earliest_dt = apple_ts_to_datetime(date_range["earliest"])
+    latest_dt = apple_ts_to_datetime(date_range["latest"])
+
+    result = {
+        "chat_name": chat["ZPARTNERNAME"],
+        "chat_jid": chat_jid,
+        "chat_type": "group" if chat["ZSESSIONTYPE"] == 1 else "dm",
+        "total_messages": total,
+        "sent_by_you": sent,
+        "received": total - sent,
+        "earliest_message": format_dt(earliest_dt),
+        "latest_message": format_dt(latest_dt),
+        "message_types": type_breakdown,
+    }
+    if top_senders:
+        result["top_senders"] = top_senders
+
+    conn.close()
+    return json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _load_lid_cache() -> None:
+    """Load the LID-to-phone mapping from the LID database."""
+    global _lid_cache, _lid_cache_loaded
+    if _lid_cache_loaded:
+        return
+    try:
+        conn = get_lid_db()
+        rows = conn.execute(
+            "SELECT ZIDENTIFIER, ZPHONENUMBER, ZDISPLAYNAME FROM ZWAZACCOUNT"
+        ).fetchall()
+        for row in rows:
+            lid = row["ZIDENTIFIER"]
+            if lid:
+                _lid_cache[lid] = {
+                    "phone": row["ZPHONENUMBER"],
+                    "display_name": row["ZDISPLAYNAME"],
+                }
+        conn.close()
+        _lid_cache_loaded = True
+    except Exception:
+        pass
+
+
+def _resolve_lid(lid: Optional[str]) -> Optional[str]:
+    """Resolve a LID to a phone number."""
+    if not lid:
+        return None
+    _load_lid_cache()
+    entry = _lid_cache.get(lid)
+    if entry:
+        return entry.get("phone")
+    return None
+
+
+def _jid_to_name(jid: Optional[str]) -> Optional[str]:
+    """Try to resolve a JID to a display name."""
+    if not jid:
+        return None
+
+    # Handle LID-based JIDs (e.g., '12345@lid')
+    if "@lid" in jid:
+        phone = _resolve_lid(jid)
+        if phone:
+            # Now resolve the phone to a contact name
+            return _jid_to_name(f"{phone}@s.whatsapp.net")
+        return None
+
+    # Strip the @s.whatsapp.net suffix to get the phone number
+    phone = jid.split("@")[0] if "@" in jid else jid
+    # Try contacts DB
+    try:
+        conn = get_contacts_db()
+        row = conn.execute(
+            "SELECT ZFULLNAME FROM ZWAADDRESSBOOKCONTACT WHERE ZWHATSAPPID = ?",
+            (phone,),
+        ).fetchone()
+        conn.close()
+        if row and row["ZFULLNAME"]:
+            return row["ZFULLNAME"]
+    except Exception:
+        pass
+    # Try chat sessions
+    try:
+        conn = get_chat_db()
+        row = conn.execute(
+            "SELECT ZPARTNERNAME FROM ZWACHATSESSION WHERE ZCONTACTJID = ?",
+            (jid,),
+        ).fetchone()
+        conn.close()
+        if row and row["ZPARTNERNAME"]:
+            return row["ZPARTNERNAME"]
+    except Exception:
+        pass
+    return phone
+
+
+# ---------------------------------------------------------------------------
+# Tool dispatcher
+# ---------------------------------------------------------------------------
+
+TOOL_MAP = {
+    "search_contacts": search_contacts,
+    "list_recent_chats": list_recent_chats,
+    "get_messages": get_messages,
+    "get_group_info": get_group_info,
+    "search_messages": search_messages,
+    "get_starred_messages": get_starred_messages,
+    "get_chat_statistics": get_chat_statistics,
+}
+
+
+def execute_tool(name: str, arguments: dict) -> str:
+    """Execute a tool by name with given arguments."""
+    func = TOOL_MAP.get(name)
+    if not func:
+        return json.dumps({"error": f"Unknown tool: {name}"})
+    try:
+        return func(**arguments)
+    except Exception as e:
+        return json.dumps({"error": f"Tool '{name}' failed: {str(e)}"})
