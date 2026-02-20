@@ -3,6 +3,9 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+import httpx
+
+from app.config import BRIDGE_URL
 from app.db import (
     get_chat_db,
     get_contacts_db,
@@ -251,6 +254,54 @@ TOOL_DEFINITIONS = [
                     }
                 },
                 "required": ["chat_jid"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_whatsapp_status",
+            "description": (
+                "Check the connection status of the WhatsApp bridge. "
+                "Returns 'connected', 'qr_pending' (needs QR scan), or 'disconnected'. "
+                "Always call this before attempting to send a message."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": (
+                "Send a WhatsApp text message via the bridge. "
+                "IMPORTANT: Before calling this tool, you MUST first show the user a draft of the message "
+                "including the recipient name and message text, and ask for their explicit confirmation. "
+                "Only call this tool AFTER the user has confirmed they want to send the message. "
+                "The recipient_jid MUST be the EXACT JID returned by search_contacts — do NOT modify it or use a different one. "
+                "The recipient_name MUST match the contact name from search_contacts — the server will verify this."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "recipient_jid": {
+                        "type": "string",
+                        "description": "The EXACT JID returned by search_contacts (e.g., '919876543210@s.whatsapp.net'). Copy this verbatim from the search result.",
+                    },
+                    "recipient_name": {
+                        "type": "string",
+                        "description": "The contact name as returned by search_contacts. Used for server-side verification to prevent sending to the wrong person.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The text message to send",
+                    },
+                },
+                "required": ["recipient_jid", "recipient_name", "message"],
             },
         },
     },
@@ -758,6 +809,61 @@ def get_chat_statistics(chat_jid: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Bridge tools (send messages via Baileys bridge)
+# ---------------------------------------------------------------------------
+
+
+def check_whatsapp_status() -> str:
+    """Check the connection status of the WhatsApp bridge."""
+    try:
+        resp = httpx.get(f"{BRIDGE_URL}/api/status", timeout=5)
+        data = resp.json()
+        return json.dumps(data)
+    except httpx.ConnectError:
+        return json.dumps({"status": "bridge_offline", "message": "WhatsApp bridge is not running. Start it with run.sh or 'cd bridge && npx tsx src/server.ts'"})
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+def send_message(recipient_jid: str, recipient_name: str, message: str) -> str:
+    """Send a text message via the WhatsApp bridge, with JID-name verification."""
+    # Server-side safety check: verify the JID actually belongs to the claimed contact
+    actual_name = _jid_to_name(recipient_jid)
+    if actual_name and recipient_name:
+        # Normalize for comparison: lowercase, strip whitespace
+        actual_lower = actual_name.lower().strip()
+        claimed_lower = recipient_name.lower().strip()
+        # Check if there's a reasonable match (one contains the other, or they're equal)
+        if actual_lower != claimed_lower and actual_lower not in claimed_lower and claimed_lower not in actual_lower:
+            return json.dumps({
+                "success": False,
+                "error": f"SAFETY BLOCK: JID {recipient_jid} belongs to '{actual_name}', but you specified '{recipient_name}'. "
+                         f"This looks like a JID mismatch. Please re-run search_contacts and use the exact JID from the result.",
+            })
+
+    try:
+        resp = httpx.post(
+            f"{BRIDGE_URL}/api/send",
+            json={"recipient": recipient_jid, "message": message},
+            timeout=15,
+        )
+        data = resp.json()
+        if resp.status_code == 200:
+            return json.dumps({
+                "success": True,
+                "recipient_jid": recipient_jid,
+                "recipient_name": actual_name or recipient_name,
+                "message_id": data.get("message_id"),
+            })
+        else:
+            return json.dumps({"success": False, "error": data.get("error", "Unknown error"), "status_code": resp.status_code})
+    except httpx.ConnectError:
+        return json.dumps({"success": False, "error": "WhatsApp bridge is not running. Start it with run.sh or 'cd bridge && npx tsx src/server.ts'"})
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -849,6 +955,8 @@ TOOL_MAP = {
     "search_messages": search_messages,
     "get_starred_messages": get_starred_messages,
     "get_chat_statistics": get_chat_statistics,
+    "check_whatsapp_status": check_whatsapp_status,
+    "send_message": send_message,
 }
 
 

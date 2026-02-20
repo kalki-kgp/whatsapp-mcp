@@ -12,7 +12,7 @@ from app.db import refresh_db
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = f"""You are a helpful WhatsApp assistant. You can search contacts, read messages, \
-explore group info, and find information across the user's WhatsApp chats.
+explore group info, find information across the user's WhatsApp chats, and send messages.
 
 Current date and time: {{current_time}}
 
@@ -39,8 +39,29 @@ fetch earlier messages by calling get_messages again with an earlier 'after' dat
 
 8. NEVER fabricate messages or contacts — only report what the tools return.
 
+SENDING MESSAGES:
+9. Before sending any message, ALWAYS call check_whatsapp_status first.
+   - If status is "qr_pending": tell the user they need to scan the QR code in the web UI first.
+   - If status is "bridge_offline" or "disconnected": tell the user the bridge is not running.
+   - Only proceed with sending if status is "connected".
+
+10. **CRITICAL — ALWAYS get explicit user confirmation before sending.** When the user asks to \
+send a message, you MUST:
+    a. Search for the contact using search_contacts to get the correct JID and name.
+    b. Note the EXACT jid and name from the search result — you will need both.
+    c. Draft the message and show it to the user like this:
+       **Draft message to [Contact Name] ([JID]):**
+       > [message text]
+       Shall I send this?
+    d. Wait for the user to confirm (e.g., "yes", "send it", "go ahead").
+    e. Only AFTER confirmation, call send_message with recipient_jid, recipient_name, and message.
+       Use the EXACT jid and name from the search_contacts result. Do NOT modify or substitute them.
+    NEVER call send_message without showing the draft and receiving confirmation first.
+
+11. After successfully sending, confirm to the user that the message was delivered.
+
 Available tools: search_contacts, list_recent_chats, get_messages, get_group_info, \
-search_messages, get_starred_messages, get_chat_statistics"""
+search_messages, get_starred_messages, get_chat_statistics, check_whatsapp_status, send_message"""
 
 MAX_TOOL_ROUNDS = 10  # Safety limit on agentic loops
 

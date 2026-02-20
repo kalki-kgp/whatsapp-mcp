@@ -3,13 +3,14 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.agent import chat, chat_sync
 from app.db import refresh_db
-from app.config import SERVER_PORT
+from app.config import SERVER_PORT, BRIDGE_URL
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -96,6 +97,36 @@ async def clear_conversation(conv_id: str):
     """Clear a conversation's history."""
     conversations.pop(conv_id, None)
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Bridge proxy endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/bridge/status")
+async def bridge_status():
+    """Proxy to WhatsApp bridge status endpoint."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{BRIDGE_URL}/api/status", timeout=5)
+            return resp.json()
+    except httpx.ConnectError:
+        return {"status": "bridge_offline"}
+    except Exception:
+        return {"status": "bridge_offline"}
+
+
+@app.get("/api/bridge/qr")
+async def bridge_qr():
+    """Proxy to WhatsApp bridge QR code endpoint."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{BRIDGE_URL}/api/qr", timeout=5)
+            return resp.json()
+    except httpx.ConnectError:
+        return {"status": "bridge_offline", "message": "Bridge not running"}
+    except Exception:
+        return {"status": "error", "message": "Failed to get QR code"}
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +667,92 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .msg-content th { background: rgba(0,168,132,0.1); font-weight: 600; }
 
+  /* ===== BRIDGE STATUS ===== */
+  .bridge-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    padding: 4px 10px;
+    border-radius: 16px;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid var(--wa-border);
+    transition: background 0.2s;
+    font-size: 11px;
+    color: var(--wa-text-secondary);
+    white-space: nowrap;
+  }
+  .bridge-status:hover { background: rgba(255,255,255,0.1); }
+  .bridge-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .bridge-dot.connected { background: #25d366; }
+  .bridge-dot.qr_pending { background: #f5c842; animation: pulse-dot 1.5s ease-in-out infinite; }
+  .bridge-dot.disconnected, .bridge-dot.bridge_offline { background: #ea4335; }
+
+  /* ===== QR MODAL ===== */
+  .qr-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+  }
+  .qr-overlay.active { display: flex; }
+  .qr-modal {
+    background: var(--wa-bg-panel);
+    border-radius: 12px;
+    padding: 28px;
+    max-width: 380px;
+    width: 90%;
+    text-align: center;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  }
+  .qr-modal h3 {
+    font-size: 18px;
+    font-weight: 500;
+    margin-bottom: 6px;
+    color: var(--wa-text);
+  }
+  .qr-modal p {
+    font-size: 13px;
+    color: var(--wa-text-secondary);
+    margin-bottom: 20px;
+    line-height: 1.5;
+  }
+  .qr-container {
+    background: #fff;
+    border-radius: 8px;
+    padding: 12px;
+    display: inline-block;
+    margin-bottom: 16px;
+    min-height: 300px;
+    min-width: 300px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .qr-container img { width: 276px; height: 276px; }
+  .qr-container .qr-loading {
+    color: #666;
+    font-size: 13px;
+  }
+  .qr-close-btn {
+    background: var(--wa-bg-input);
+    border: 1px solid var(--wa-border);
+    color: var(--wa-text);
+    padding: 8px 24px;
+    border-radius: 20px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 0.2s;
+  }
+  .qr-close-btn:hover { background: var(--wa-bg-header); }
+
   /* ===== RESPONSIVE ===== */
   @media (max-width: 768px) {
     .messages { padding: 10px 12px 8px; }
@@ -658,6 +775,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
   <div class="header-actions">
+    <div class="bridge-status" id="bridge-status" onclick="onBridgeStatusClick()" title="WhatsApp Bridge connection status">
+      <div class="bridge-dot disconnected" id="bridge-dot"></div>
+      <span id="bridge-label">Bridge offline</span>
+    </div>
     <div class="view-toggle" id="view-toggle">
       <button class="active" data-view="user" onclick="setView('user')">User</button>
       <button data-view="dev" onclick="setView('dev')">Dev</button>
@@ -703,6 +824,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- QR MODAL -->
+<div class="qr-overlay" id="qr-overlay" onclick="closeQRModal(event)">
+  <div class="qr-modal">
+    <h3>Connect WhatsApp</h3>
+    <p>Scan the QR code with your phone:<br>WhatsApp &gt; Settings &gt; Linked Devices &gt; Link a Device</p>
+    <div class="qr-container" id="qr-container">
+      <span class="qr-loading">Loading QR code...</span>
+    </div>
+    <br>
+    <button class="qr-close-btn" onclick="closeQRModal()">Close</button>
   </div>
 </div>
 
@@ -1164,6 +1298,92 @@ function escapeHtml(text) {
   d.textContent = text;
   return d.innerHTML;
 }
+
+// ===== BRIDGE STATUS =====
+let bridgeStatus = 'bridge_offline';
+let bridgePollingInterval = null;
+let qrPollingInterval = null;
+let qrModalOpen = false;
+
+const bridgeDot = document.getElementById('bridge-dot');
+const bridgeLabel = document.getElementById('bridge-label');
+
+const bridgeLabels = {
+  connected: 'Connected',
+  qr_pending: 'Scan QR',
+  disconnected: 'Disconnected',
+  bridge_offline: 'Bridge offline',
+};
+
+async function pollBridgeStatus() {
+  try {
+    const res = await fetch('/api/bridge/status');
+    const data = await res.json();
+    const newStatus = data.status || 'bridge_offline';
+    if (newStatus !== bridgeStatus) {
+      bridgeStatus = newStatus;
+      updateBridgeUI();
+    }
+  } catch {
+    if (bridgeStatus !== 'bridge_offline') {
+      bridgeStatus = 'bridge_offline';
+      updateBridgeUI();
+    }
+  }
+}
+
+function updateBridgeUI() {
+  bridgeDot.className = 'bridge-dot ' + bridgeStatus;
+  bridgeLabel.textContent = bridgeLabels[bridgeStatus] || bridgeStatus;
+
+  // If connected while QR modal is open, close it
+  if (bridgeStatus === 'connected' && qrModalOpen) {
+    closeQRModal();
+  }
+}
+
+function onBridgeStatusClick() {
+  if (bridgeStatus === 'connected') return;
+  openQRModal();
+}
+
+function openQRModal() {
+  qrModalOpen = true;
+  document.getElementById('qr-overlay').classList.add('active');
+  fetchQR();
+  // Poll QR more frequently while modal is open
+  qrPollingInterval = setInterval(fetchQR, 3000);
+}
+
+function closeQRModal(event) {
+  if (event && event.target !== document.getElementById('qr-overlay') && !event.target.classList.contains('qr-close-btn')) return;
+  qrModalOpen = false;
+  document.getElementById('qr-overlay').classList.remove('active');
+  clearInterval(qrPollingInterval);
+  qrPollingInterval = null;
+}
+
+async function fetchQR() {
+  const container = document.getElementById('qr-container');
+  try {
+    const res = await fetch('/api/bridge/qr');
+    const data = await res.json();
+    if (data.qr) {
+      container.innerHTML = `<img src="${data.qr}" alt="QR Code">`;
+    } else if (data.status === 'connected') {
+      container.innerHTML = '<span class="qr-loading" style="color:#25d366">Connected!</span>';
+      setTimeout(closeQRModal, 1500);
+    } else {
+      container.innerHTML = '<span class="qr-loading">Waiting for QR code...<br>Make sure the bridge is running.</span>';
+    }
+  } catch {
+    container.innerHTML = '<span class="qr-loading">Bridge not reachable.<br>Start it with ./run.sh</span>';
+  }
+}
+
+// Start polling bridge status
+pollBridgeStatus();
+bridgePollingInterval = setInterval(pollBridgeStatus, 10000);
 </script>
 </body>
 </html>"""

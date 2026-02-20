@@ -23,3 +23,6 @@ LLM_MODEL = "moonshotai/Kimi-K2-Instruct"
 
 # Server
 SERVER_PORT = 3009
+
+# WhatsApp Bridge (Baileys sidecar)
+BRIDGE_URL = "http://localhost:3010"

@@ -5,3 +5,6 @@ __pycache__/
 references/
 /tmp/whatsapp-assistant-db/
 .DS_Store
+bridge/node_modules/
+bridge/auth_info/
+bridge/dist/
