@@ -23,6 +23,10 @@ app = FastAPI(title="WhatsApp Assistant", version="0.2.0")
 # In-memory conversation store (per session)
 conversations: dict[str, list[dict]] = {}
 
+# Voice event stream — voice assistant pushes events here, UI polls them
+voice_events: list[dict] = []
+voice_event_id: int = 0
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -212,6 +216,31 @@ async def api_tts_test(request: Request):
         return {"status": "ok"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Voice event stream
+# ---------------------------------------------------------------------------
+
+@app.post("/api/voice/event")
+async def api_voice_event(request: Request):
+    """Voice assistant pushes events here for the UI to display."""
+    global voice_event_id
+    body = await request.json()
+    voice_event_id += 1
+    body["id"] = voice_event_id
+    voice_events.append(body)
+    # Keep last 200 events
+    if len(voice_events) > 200:
+        del voice_events[:len(voice_events) - 200]
+    return {"id": voice_event_id}
+
+
+@app.get("/api/voice/events")
+async def api_voice_events(after: int = 0):
+    """UI polls for voice events after a given ID."""
+    new = [e for e in voice_events if e["id"] > after]
+    return {"events": new}
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +485,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .msg .time { font-size: 10px; color: var(--text-3); }
   .msg.user .check-marks { display: inline-flex; margin-left: 2px; }
   .msg.user .check-marks svg { width: 16px; height: 11px; fill: var(--blue); }
+  .voice-badge {
+    display: inline-flex; align-items: center; gap: 3px;
+    font-size: 10px; color: var(--accent); opacity: 0.7;
+  }
+  .voice-badge svg { width: 12px; height: 12px; fill: var(--accent); }
 
   /* ===== TYPING ===== */
   .typing-bubble {
@@ -1061,6 +1095,67 @@ async function saveSettings(){
     document.getElementById('settings-overlay').classList.remove('active');
   } catch(e) { console.error('Failed to save settings', e); }
 }
+
+// ===== VOICE EVENT STREAM =====
+let lastVoiceEventId = 0;
+let voiceTypingEl = null;
+
+function addVoiceMsg(role, content, tc) {
+  // Reuse the existing addMsg which handles formatting, tool panels, dev view, etc.
+  const el = addMsg(role, content, tc || [], []);
+  // Add mic badge to the meta row to indicate this came from voice
+  if (el) {
+    const meta = el.querySelector('.meta-row');
+    if (meta) {
+      const vb = document.createElement('span'); vb.className = 'voice-badge';
+      vb.innerHTML = '<svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5zm6 6c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>';
+      meta.insertBefore(vb, meta.firstChild);
+    }
+  }
+}
+
+function showVoiceTyping() {
+  if (voiceTypingEl) return;
+  const w = document.getElementById('welcome-screen'); if(w) w.remove(); addDS();
+  voiceTypingEl = document.createElement('div'); voiceTypingEl.className = 'typing-bubble'; voiceTypingEl.id = 'voice-typing';
+  voiceTypingEl.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div><div class="typing-status"><div class="spinner"></div><span id="vttext">Processing voice command...</span></div>';
+  M.appendChild(voiceTypingEl); M.scrollTop = M.scrollHeight;
+}
+
+function updateVoiceTyping(text) {
+  const el = document.getElementById('vttext');
+  if (el) el.textContent = text;
+  M.scrollTop = M.scrollHeight;
+}
+
+function removeVoiceTyping() {
+  if (voiceTypingEl) { voiceTypingEl.remove(); voiceTypingEl = null; }
+}
+
+async function pollVoiceEvents() {
+  try {
+    const r = await fetch(`/api/voice/events?after=${lastVoiceEventId}`);
+    const d = await r.json();
+    if (!d.events || d.events.length === 0) return;
+    for (const ev of d.events) {
+      lastVoiceEventId = ev.id;
+      if (ev.type === 'voice_user') {
+        removeVoiceTyping();
+        addVoiceMsg('user', ev.text);
+        showVoiceTyping();
+      } else if (ev.type === 'voice_tool_call') {
+        updateVoiceTyping(`Calling ${ev.name}...`);
+      } else if (ev.type === 'voice_tool_result') {
+        updateVoiceTyping(`${ev.name} done`);
+      } else if (ev.type === 'voice_assistant') {
+        removeVoiceTyping();
+        addVoiceMsg('assistant', ev.text, ev.tool_calls);
+      }
+    }
+  } catch {}
+}
+
+setInterval(pollVoiceEvents, 1000);
 </script>
 </body>
 </html>"""

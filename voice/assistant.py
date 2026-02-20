@@ -84,8 +84,25 @@ def beep():
     )
 
 
+def push_voice_event(server: str, event: dict):
+    """Push a voice event to the server for the UI to display."""
+    try:
+        payload = json.dumps(event).encode()
+        req = urllib.request.Request(
+            f"{server}/api/voice/event",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        pass  # Non-critical — UI display is best-effort
+
+
 def send_chat(server: str, message: str, conversation_id: str) -> tuple[str, str]:
-    """Stream /api/chat/stream, print live progress, return (response, conv_id)."""
+    """Stream /api/chat/stream, print live progress, push events to UI."""
+    # Push user message to UI
+    push_voice_event(server, {"type": "voice_user", "text": message})
+
     payload = json.dumps({
         "message": message,
         "conversation_id": conversation_id,
@@ -99,6 +116,8 @@ def send_chat(server: str, message: str, conversation_id: str) -> tuple[str, str
     conv_id = conversation_id
     final_content = ""
     tool_count = 0
+    tool_calls = []
+    tool_results = []
 
     for raw_line in resp:
         line = raw_line.decode("utf-8").strip()
@@ -119,17 +138,16 @@ def send_chat(server: str, message: str, conversation_id: str) -> tuple[str, str
             tool_count += 1
             name = ev.get("name", "?")
             args = ev.get("arguments", {})
-            # Show a compact summary of tool args
+            tool_calls.append({"name": name, "arguments": args})
             arg_summary = ", ".join(f"{k}={_short(v)}" for k, v in args.items()) if args else ""
             print(f"  [{tool_count}] Calling {name}({arg_summary})")
+            push_voice_event(server, {"type": "voice_tool_call", "name": name, "arguments": args})
         elif etype == "tool_result":
             name = ev.get("name", "?")
             result = ev.get("result", "")
-            # Show a brief snippet of the result
-            preview = result[:100].replace("\n", " ") if result else "(empty)"
-            if len(result) > 100:
-                preview += "..."
+            tool_results.append(result)
             print(f"      -> {name} returned {len(result)} chars")
+            push_voice_event(server, {"type": "voice_tool_result", "name": name})
         elif etype == "message":
             final_content = ev.get("content", "")
         elif etype == "error":
@@ -138,6 +156,14 @@ def send_chat(server: str, message: str, conversation_id: str) -> tuple[str, str
     resp.close()
     if not final_content:
         final_content = "Sorry, I got an empty response."
+
+    # Push assistant response to UI (no raw tool results — keep events slim)
+    push_voice_event(server, {
+        "type": "voice_assistant",
+        "text": final_content,
+        "tool_calls": tool_calls,
+    })
+
     return final_content, conv_id
 
 
