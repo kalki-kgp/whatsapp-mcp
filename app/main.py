@@ -33,6 +33,11 @@ async def startup_event():
     start_scheduler()
 
 
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "version": app.version}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTML_PAGE
@@ -965,7 +970,7 @@ function clearChat(){
   conversationId=null;M.innerHTML=welcomeHTML;
 }
 
-function renderMD(t){if(!t)return'';let h=esc(t);
+function renderMD(t){if(!t)return'';let s=t.replace(/<tts>[\s\S]*?<\/tts>/g,'').trim();let h=esc(s||t);
   h=h.replace(/```([\s\S]*?)```/g,'<pre><code>$1</code></pre>');
   h=h.replace(/`([^`]+)`/g,'<code>$1</code>');
   h=h.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');

@@ -57,23 +57,41 @@ def fetch_settings(server: str) -> dict:
         return defaults
 
 
-def speak(text: str, voice: str = "Samantha", speed: int = 190):
-    """Speak text using macOS `say` command, stripping developer details."""
+def extract_tts(text: str) -> tuple[str, str]:
+    """
+    Extract <tts>...</tts> content from response.
+    Returns (tts_text, display_text).
+    - tts_text: what to speak (from <tts> tags, or full text if no tags)
+    - display_text: full response with <tts> tags stripped for UI display
+    """
+    match = re.search(r'<tts>(.*?)</tts>', text, re.DOTALL)
+    # Strip <tts> tags from display text
+    display = re.sub(r'\s*<tts>.*?</tts>\s*', '', text, flags=re.DOTALL).strip()
+    if match:
+        return match.group(1).strip(), display or text
+    # No <tts> tags — speak the full text
+    return text, text
+
+
+def _clean_for_tts(text: str) -> str:
+    """Clean text for TTS: strip markdown, JIDs, emoji."""
     clean = text
-    # Remove JIDs: (918767650199@s.whatsapp.net) or bare 918767650199@s.whatsapp.net
     clean = re.sub(r'\s*\(?[\w.+-]+@[\w.]+\)?\s*', ' ', clean)
-    # Remove markdown: **, *, `, >, blockquotes
     clean = clean.replace("**", "").replace("`", "")
     clean = re.sub(r'^\s*>\s?', '', clean, flags=re.MULTILINE)
     clean = clean.replace("*", "")
-    # Remove common emoji that don't read well in TTS
     clean = re.sub(r'[^\x00-\x7F\u00C0-\u024F\u0900-\u097F]+', ' ', clean)
-    # Collapse whitespace
     clean = re.sub(r'[ \t]+', ' ', clean).strip()
-    # Truncate very long responses for TTS
     if len(clean) > 2000:
         clean = clean[:2000] + "... I've truncated the rest for brevity."
-    subprocess.run(["say", "-v", voice, "-r", str(speed), clean])
+    return clean
+
+
+def speak(text: str, voice: str = "Samantha", speed: int = 190):
+    """Speak text using macOS `say` command."""
+    clean = _clean_for_tts(text)
+    if clean:
+        subprocess.run(["say", "-v", voice, "-r", str(speed), clean])
 
 
 def beep():
@@ -157,14 +175,17 @@ def send_chat(server: str, message: str, conversation_id: str) -> tuple[str, str
     if not final_content:
         final_content = "Sorry, I got an empty response."
 
-    # Push assistant response to UI (no raw tool results — keep events slim)
+    # Separate TTS content from display content
+    tts_text, display_text = extract_tts(final_content)
+
+    # Push clean display text to UI (no <tts> tags)
     push_voice_event(server, {
         "type": "voice_assistant",
-        "text": final_content,
+        "text": display_text,
         "tool_calls": tool_calls,
     })
 
-    return final_content, conv_id
+    return tts_text, display_text, conv_id
 
 
 def _short(v, max_len=30):
@@ -427,17 +448,21 @@ def main():
 
         # Send to assistant
         try:
-            response, conversation_id = send_chat(server, command, conversation_id)
+            tts_text, display_text, conversation_id = send_chat(server, command, conversation_id)
         except Exception as e:
             print(f"  Chat error: {e}")
             speak("Sorry, I couldn't reach the assistant.", tts_voice, tts_speed)
             in_conversation = False
             continue
 
-        print(f"  Response: {response[:120]}{'...' if len(response) > 120 else ''}")
+        if tts_text != display_text:
+            print(f"  Response (UI): {display_text[:80]}...")
+            print(f"  Speaking: {tts_text[:120]}{'...' if len(tts_text) > 120 else ''}")
+        else:
+            print(f"  Response: {display_text[:120]}{'...' if len(display_text) > 120 else ''}")
 
-        # Speak response
-        speak(response, tts_voice, tts_speed)
+        # Speak only the TTS portion
+        speak(tts_text, tts_voice, tts_speed)
 
         # Enter follow-up mode — next listen won't need wake word
         if auto_listen:

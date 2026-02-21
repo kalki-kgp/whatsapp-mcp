@@ -1,0 +1,446 @@
+#!/bin/bash
+# tanu — CLI launcher for the WhatsApp Assistant
+# Usage: tanu [command]
+#
+# Commands:
+#   (none) / start   Start server + bridge, open browser
+#   stop             Stop all services
+#   restart          Stop + start
+#   status           Show what's running
+#   voice            Start voice assistant in foreground
+#   voice stop       Stop voice assistant
+#   menubar          Launch menu bar controller
+#   logs [service]   Tail logs (server|bridge|voice|all)
+#   update           Git pull + reinstall deps if changed
+#   uninstall        Run uninstaller
+
+set -euo pipefail
+
+TANU_HOME="${TANU_HOME:-$HOME/.tanu}"
+APP_DIR="$TANU_HOME/app"
+VENV_DIR="$TANU_HOME/venv"
+LOG_DIR="$TANU_HOME/logs"
+RUN_DIR="$TANU_HOME/run"
+ENV_FILE="$TANU_HOME/.env"
+
+SERVER_PORT=3009
+BRIDGE_PORT=3010
+SERVER_HOST="127.0.0.1"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+log()  { echo -e "${BLUE}[tanu]${NC} $*"; }
+ok()   { echo -e "${GREEN}[tanu]${NC} $*"; }
+warn() { echo -e "${YELLOW}[tanu]${NC} $*"; }
+err()  { echo -e "${RED}[tanu]${NC} $*" >&2; }
+
+# --- helpers ---
+
+is_running() {
+    local pidfile="$RUN_DIR/$1.pid"
+    if [ -f "$pidfile" ]; then
+        local pid
+        pid=$(cat "$pidfile")
+        if kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        # Stale PID file
+        rm -f "$pidfile"
+    fi
+    return 1
+}
+
+get_pid() {
+    local pidfile="$RUN_DIR/$1.pid"
+    if [ -f "$pidfile" ]; then
+        cat "$pidfile"
+    fi
+}
+
+check_port() {
+    local port=$1
+    if lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
+        return 0  # port in use
+    fi
+    return 1  # port free
+}
+
+wait_for_port() {
+    local port=$1 max=$2 i=0
+    while [ $i -lt "$max" ]; do
+        if check_port "$port"; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+ensure_env() {
+    if [ ! -f "$ENV_FILE" ]; then
+        err "No .env file found at $ENV_FILE"
+        err "Run the installer again or create it manually with NEBIUS_API_KEY=..."
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    set -a; source "$ENV_FILE"; set +a
+    if [ -z "${NEBIUS_API_KEY:-}" ]; then
+        err "NEBIUS_API_KEY is not set in $ENV_FILE"
+        exit 1
+    fi
+}
+
+ensure_dirs() {
+    mkdir -p "$LOG_DIR" "$RUN_DIR"
+}
+
+# --- commands ---
+
+cmd_start() {
+    ensure_env
+    ensure_dirs
+
+    # Check if already running
+    if is_running server && is_running bridge; then
+        ok "Tanu is already running."
+        echo "  Server PID: $(get_pid server)"
+        echo "  Bridge PID: $(get_pid bridge)"
+        echo "  Open: http://$SERVER_HOST:$SERVER_PORT"
+        return 0
+    fi
+
+    # Check for port conflicts
+    if ! is_running server && check_port $SERVER_PORT; then
+        err "Port $SERVER_PORT is already in use by another process."
+        err "Run: lsof -iTCP:$SERVER_PORT -sTCP:LISTEN"
+        exit 1
+    fi
+    if ! is_running bridge && check_port $BRIDGE_PORT; then
+        err "Port $BRIDGE_PORT is already in use by another process."
+        err "Run: lsof -iTCP:$BRIDGE_PORT -sTCP:LISTEN"
+        exit 1
+    fi
+
+    # Start bridge
+    if ! is_running bridge; then
+        log "Starting WhatsApp bridge on :$BRIDGE_PORT..."
+        cd "$APP_DIR/bridge"
+        npx tsx src/server.ts >> "$LOG_DIR/bridge.log" 2>&1 &
+        echo $! > "$RUN_DIR/bridge.pid"
+        cd - > /dev/null
+
+        if ! wait_for_port $BRIDGE_PORT 10; then
+            warn "Bridge may not have started. Check: tanu logs bridge"
+        else
+            ok "Bridge started (PID $(get_pid bridge))"
+        fi
+    else
+        ok "Bridge already running (PID $(get_pid bridge))"
+    fi
+
+    # Start server
+    if ! is_running server; then
+        log "Starting server on $SERVER_HOST:$SERVER_PORT..."
+        cd "$APP_DIR"
+        "$VENV_DIR/bin/python" -m uvicorn app.main:app \
+            --host "$SERVER_HOST" --port "$SERVER_PORT" \
+            >> "$LOG_DIR/server.log" 2>&1 &
+        echo $! > "$RUN_DIR/server.pid"
+        cd - > /dev/null
+
+        if ! wait_for_port $SERVER_PORT 10; then
+            warn "Server may not have started. Check: tanu logs server"
+        else
+            ok "Server started (PID $(get_pid server))"
+        fi
+    else
+        ok "Server already running (PID $(get_pid server))"
+    fi
+
+    echo ""
+    ok "Tanu is running!"
+    echo "  Open: http://$SERVER_HOST:$SERVER_PORT"
+    echo ""
+
+    # Open browser
+    open "http://$SERVER_HOST:$SERVER_PORT" 2>/dev/null || true
+}
+
+cmd_stop() {
+    local stopped=false
+
+    for svc in voice server bridge; do
+        if is_running "$svc"; then
+            local pid
+            pid=$(get_pid "$svc")
+            log "Stopping $svc (PID $pid)..."
+            kill "$pid" 2>/dev/null || true
+            # Wait up to 5 seconds for graceful shutdown
+            for _ in $(seq 1 10); do
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    break
+                fi
+                sleep 0.5
+            done
+            # Force kill if still running
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+            rm -f "$RUN_DIR/$svc.pid"
+            ok "$svc stopped."
+            stopped=true
+        fi
+    done
+
+    if [ "$stopped" = false ]; then
+        log "Nothing is running."
+    fi
+}
+
+cmd_restart() {
+    cmd_stop
+    sleep 1
+    cmd_start
+}
+
+cmd_status() {
+    echo -e "${BOLD}Tanu Status${NC}"
+    echo "──────────────────────"
+
+    for svc in server bridge voice; do
+        if is_running "$svc"; then
+            local pid
+            pid=$(get_pid "$svc")
+            echo -e "  $svc:  ${GREEN}running${NC} (PID $pid)"
+        else
+            echo -e "  $svc:  ${RED}stopped${NC}"
+        fi
+    done
+
+    echo ""
+
+    # Try to get bridge WhatsApp status
+    if is_running server; then
+        local health
+        health=$(curl -s --max-time 2 "http://$SERVER_HOST:$SERVER_PORT/api/health" 2>/dev/null || echo "")
+        if [ -n "$health" ]; then
+            local version
+            version=$(echo "$health" | python3 -c "import sys,json; print(json.load(sys.stdin).get('version','?'))" 2>/dev/null || echo "?")
+            echo "  version: $version"
+        fi
+    fi
+
+    if is_running bridge; then
+        local bridge_status
+        bridge_status=$(curl -s --max-time 2 "http://localhost:$BRIDGE_PORT/api/status" 2>/dev/null || echo "")
+        if [ -n "$bridge_status" ]; then
+            local wa_state
+            wa_state=$(echo "$bridge_status" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null || echo "unknown")
+            echo "  whatsapp: $wa_state"
+        fi
+    fi
+
+    echo ""
+    if is_running server; then
+        echo "  URL: http://$SERVER_HOST:$SERVER_PORT"
+    fi
+}
+
+cmd_voice() {
+    if [ "${1:-}" = "stop" ]; then
+        if is_running voice; then
+            local pid
+            pid=$(get_pid voice)
+            log "Stopping voice assistant (PID $pid)..."
+            kill "$pid" 2>/dev/null || true
+            rm -f "$RUN_DIR/voice.pid"
+            ok "Voice assistant stopped."
+        else
+            log "Voice assistant is not running."
+        fi
+        return
+    fi
+
+    ensure_env
+
+    if ! is_running server; then
+        err "Server is not running. Start it first with: tanu start"
+        exit 1
+    fi
+
+    if is_running voice; then
+        warn "Voice assistant is already running (PID $(get_pid voice))."
+        warn "Stop it first with: tanu voice stop"
+        exit 1
+    fi
+
+    log "Starting voice assistant..."
+    log "Say '${BOLD}hey tanu${NC}' followed by your command."
+    log "Press Ctrl+C to stop."
+    echo ""
+
+    # Run in foreground, but track PID
+    cd "$APP_DIR"
+    "$VENV_DIR/bin/python" voice/assistant.py &
+    local vpid=$!
+    echo $vpid > "$RUN_DIR/voice.pid"
+
+    # Wait for it (foreground behavior)
+    trap 'kill $vpid 2>/dev/null; rm -f "$RUN_DIR/voice.pid"; exit 0' INT TERM
+    wait $vpid
+    rm -f "$RUN_DIR/voice.pid"
+}
+
+cmd_menubar() {
+    ensure_env
+    log "Starting menu bar controller..."
+    cd "$APP_DIR"
+    "$VENV_DIR/bin/python" launcher/tanu-menubar.py &
+    disown
+    ok "Menu bar controller launched."
+}
+
+cmd_logs() {
+    local svc="${1:-all}"
+    ensure_dirs
+
+    case "$svc" in
+        server|bridge|voice)
+            if [ -f "$LOG_DIR/$svc.log" ]; then
+                tail -f "$LOG_DIR/$svc.log"
+            else
+                warn "No log file for $svc yet."
+            fi
+            ;;
+        all)
+            tail -f "$LOG_DIR"/*.log 2>/dev/null || warn "No log files yet."
+            ;;
+        *)
+            err "Unknown service: $svc (use server, bridge, voice, or all)"
+            exit 1
+            ;;
+    esac
+}
+
+cmd_update() {
+    log "Checking for updates..."
+    cd "$APP_DIR"
+
+    git fetch origin main 2>/dev/null || { err "Failed to fetch from remote."; exit 1; }
+
+    local local_head remote_head
+    local_head=$(git rev-parse HEAD)
+    remote_head=$(git rev-parse origin/main)
+
+    if [ "$local_head" = "$remote_head" ]; then
+        ok "Already up to date."
+        return 0
+    fi
+
+    log "Updates available. Pulling..."
+
+    # Track files for dependency changes
+    local old_requirements old_package old_swift
+    old_requirements=$(md5 -q requirements.txt 2>/dev/null || echo "")
+    old_package=$(md5 -q bridge/package.json 2>/dev/null || echo "")
+    old_swift=$(md5 -q voice/apple_stt.swift 2>/dev/null || echo "")
+
+    # Stop services before updating
+    local was_running=false
+    if is_running server || is_running bridge; then
+        was_running=true
+        cmd_stop
+    fi
+
+    git pull origin main || { err "Git pull failed."; exit 1; }
+
+    # Reinstall Python deps if requirements changed
+    local new_requirements
+    new_requirements=$(md5 -q requirements.txt 2>/dev/null || echo "")
+    if [ "$old_requirements" != "$new_requirements" ]; then
+        log "requirements.txt changed — reinstalling Python deps..."
+        "$VENV_DIR/bin/pip" install -r requirements.txt -q
+    fi
+
+    # Reinstall npm deps if package.json changed
+    local new_package
+    new_package=$(md5 -q bridge/package.json 2>/dev/null || echo "")
+    if [ "$old_package" != "$new_package" ]; then
+        log "bridge/package.json changed — reinstalling npm deps..."
+        (cd bridge && npm install --silent)
+    fi
+
+    # Recompile Swift STT if changed
+    local new_swift
+    new_swift=$(md5 -q voice/apple_stt.swift 2>/dev/null || echo "")
+    if [ "$old_swift" != "$new_swift" ]; then
+        log "apple_stt.swift changed — recompiling..."
+        swiftc voice/apple_stt.swift -o voice/apple_stt \
+            -framework Speech -framework AVFoundation 2>/dev/null || \
+            warn "Swift compilation failed (non-fatal)."
+    fi
+
+    # Save version
+    git rev-parse --short HEAD > "$TANU_HOME/version"
+
+    ok "Updated to $(cat "$TANU_HOME/version")!"
+    if [ "$was_running" = true ]; then
+        echo "  Run '${BOLD}tanu start${NC}' to restart."
+    fi
+}
+
+cmd_uninstall() {
+    if [ -f "$APP_DIR/installer/uninstall.sh" ]; then
+        bash "$APP_DIR/installer/uninstall.sh"
+    else
+        err "Uninstaller not found. Remove ~/.tanu manually."
+    fi
+}
+
+cmd_help() {
+    echo -e "${BOLD}tanu${NC} — WhatsApp Assistant"
+    echo ""
+    echo "Usage: tanu [command]"
+    echo ""
+    echo "Commands:"
+    echo "  start          Start server + bridge, open browser (default)"
+    echo "  stop           Stop all services"
+    echo "  restart        Stop + start"
+    echo "  status         Show what's running"
+    echo "  voice          Start voice assistant (foreground)"
+    echo "  voice stop     Stop voice assistant"
+    echo "  menubar        Launch menu bar controller"
+    echo "  logs [svc]     Tail logs (server|bridge|voice|all)"
+    echo "  update         Pull latest code + reinstall deps"
+    echo "  uninstall      Remove Tanu"
+    echo "  help           Show this help"
+}
+
+# --- main ---
+
+CMD="${1:-start}"
+
+case "$CMD" in
+    start)     cmd_start ;;
+    stop)      cmd_stop ;;
+    restart)   cmd_restart ;;
+    status)    cmd_status ;;
+    voice)     cmd_voice "${2:-}" ;;
+    menubar)   cmd_menubar ;;
+    logs)      cmd_logs "${2:-all}" ;;
+    update)    cmd_update ;;
+    uninstall) cmd_uninstall ;;
+    help|--help|-h) cmd_help ;;
+    *)
+        err "Unknown command: $CMD"
+        cmd_help
+        exit 1
+        ;;
+esac
