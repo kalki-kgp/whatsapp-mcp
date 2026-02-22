@@ -1,5 +1,5 @@
 #!/bin/bash
-# WhatsApp Assistant — Installer for macOS
+# WhatsApp MCP — Installer for macOS
 #
 # Usage:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/kalki-kgp/whatsapp-assistant/main/installer/install.sh)
@@ -36,7 +36,7 @@ step() { echo -e "\n${BOLD}$*${NC}"; }
 
 echo ""
 echo -e "${BOLD}╭─────────────────────────────────────╮${NC}"
-echo -e "${BOLD}│     WhatsApp Assistant Installer      │${NC}"
+echo -e "${BOLD}│     WhatsApp MCP Installer      │${NC}"
 echo -e "${BOLD}│              macOS only               │${NC}"
 echo -e "${BOLD}╰─────────────────────────────────────╯${NC}"
 echo ""

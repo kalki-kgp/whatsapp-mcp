@@ -1,6 +1,6 @@
 #!/bin/bash
-# WhatsApp Assistant — Uninstaller
-# Removes all WhatsApp Assistant files and services.
+# WhatsApp MCP — Uninstaller
+# Removes all WhatsApp MCP files and services.
 
 set -euo pipefail
 
@@ -9,7 +9,7 @@ GREEN='\033[0;32m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-echo -e "${BOLD}Uninstalling WhatsApp Assistant...${NC}"
+echo -e "${BOLD}Uninstalling WhatsApp MCP...${NC}"
 echo ""
 
 # Stop running services
@@ -35,6 +35,6 @@ rm -rf /tmp/whatsapp-assistant-db
 echo -e "${GREEN}  ✓${NC} Removed temp files"
 
 echo ""
-echo -e "${GREEN}WhatsApp Assistant has been uninstalled.${NC}"
+echo -e "${GREEN}WhatsApp MCP has been uninstalled.${NC}"
 echo -e "  Note: Homebrew packages (python, node, portaudio) were not removed."
 echo -e "  To remove them: brew uninstall python@3 node portaudio"

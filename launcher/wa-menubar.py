@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-WhatsApp Assistant — macOS Menu Bar Controller
+WhatsApp MCP — macOS Menu Bar Controller
 
-Provides a menu bar icon with status and controls for the WhatsApp Assistant.
+Provides a menu bar icon with status and controls for the WhatsApp MCP.
 Requires: pip install rumps
 
 Launch via: wa menubar
@@ -115,15 +115,15 @@ class WAMenuBar(rumps.App):
 
     def on_start(self, _):
         run_wa("start")
-        rumps.notification("WhatsApp Assistant", "", "Starting server...")
+        rumps.notification("WhatsApp MCP", "", "Starting server...")
 
     def on_stop(self, _):
         run_wa("stop")
-        rumps.notification("WhatsApp Assistant", "", "Stopping server...")
+        rumps.notification("WhatsApp MCP", "", "Stopping server...")
 
     def on_restart(self, _):
         run_wa("restart")
-        rumps.notification("WhatsApp Assistant", "", "Restarting server...")
+        rumps.notification("WhatsApp MCP", "", "Restarting server...")
 
     def on_voice_start(self, _):
         """Open Terminal.app with wa voice for proper mic permissions."""
@@ -141,7 +141,7 @@ class WAMenuBar(rumps.App):
         subprocess.Popen(["open", log_dir])
 
     def on_check_updates(self, _):
-        rumps.notification("WhatsApp Assistant", "", "Checking for updates...")
+        rumps.notification("WhatsApp MCP", "", "Checking for updates...")
         threading.Thread(target=self._do_update, daemon=True).start()
 
     def _do_update(self):
@@ -150,7 +150,7 @@ class WAMenuBar(rumps.App):
             capture_output=True, text=True
         )
         output = result.stdout.strip().split("\n")[-1] if result.stdout.strip() else "Update check complete."
-        rumps.notification("WhatsApp Assistant", "", output)
+        rumps.notification("WhatsApp MCP", "", output)
 
     def on_toggle_login(self, sender):
         if sender.state:

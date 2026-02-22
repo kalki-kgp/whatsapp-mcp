@@ -1,14 +1,14 @@
-# WhatsApp Assistant
+# WhatsApp MCP
 
-AI-powered WhatsApp assistant for macOS with voice control. Chat with an AI that can read your WhatsApp messages, send replies, search contacts, schedule messages, and more — all from your browser or by voice.
+An AI-powered MCP (Model Context Protocol) layer for WhatsApp on macOS. Gives an LLM full tool-calling access to your WhatsApp — read messages, search contacts, send replies, schedule messages — all through a browser UI or voice.
 
 ## Features
 
-- **AI Chat** — Ask questions about your WhatsApp conversations, send messages, search contacts
-- **WhatsApp Bridge** — Connects via WhatsApp Web (Baileys) for sending/receiving messages
-- **Voice Assistant** — Wake word detection, speech-to-text (Apple/Google), text-to-speech via macOS
-- **Scheduled Messages** — Schedule messages to be sent at a specific time
-- **Browser UI** — Clean web interface at `localhost:3009`
+- **Tool-calling AI** — LLM with tools to search contacts, read chats, send messages, check unread, schedule sends
+- **WhatsApp Bridge** — Connects via WhatsApp Web (Baileys) for real-time send/receive
+- **Local DB access** — Reads your macOS WhatsApp SQLite databases directly
+- **Voice control** — Wake word detection, speech-to-text (Apple/Google), text-to-speech
+- **Browser UI** — Chat interface at `localhost:3009` with live status
 - **Menu Bar App** — macOS menu bar icon for quick controls
 
 ## Install
@@ -37,7 +37,7 @@ wa                # Start server + bridge, opens browser
 wa stop           # Stop all services
 wa restart        # Restart everything
 wa status         # Show what's running
-wa voice          # Start voice assistant (say "hey assistant" + command)
+wa voice          # Start voice assistant
 wa menubar        # Launch menu bar controller
 wa logs           # Tail all logs
 wa logs server    # Tail server logs only
@@ -50,25 +50,34 @@ wa help           # Show all commands
 
 ```
 Browser UI ──→ FastAPI Server (:3009) ──→ Nebius LLM (Kimi-K2)
+                    │                          │
+                    │                    Tool calls:
+                    │                     - search_contacts
+                    │                     - get_messages
+                    │                     - send_message
+                    │                     - search_messages
+                    │                     - get_unread_summary
+                    │                     - schedule_message
+                    │                     - ...
                     │
                     ├──→ WhatsApp Bridge (:3010) ──→ WhatsApp Web
                     │
                     └──→ SQLite DBs (local WhatsApp data)
 
-Voice Assistant ──→ Mic → STT → Server → LLM → TTS → Speaker
+Voice ──→ Mic → STT → Server → LLM + Tools → TTS → Speaker
 ```
 
-The server reads your local WhatsApp database (macOS WhatsApp app required) and connects to WhatsApp Web via the Baileys bridge for sending messages. The AI uses tool calling to search contacts, read messages, send replies, and schedule messages.
+The server reads your local WhatsApp database (macOS WhatsApp app required) and connects to WhatsApp Web via the Baileys bridge for sending messages. The LLM uses tool calling to search contacts, read conversations, send replies, and schedule messages.
 
-## Voice Assistant
+## Voice
 
-The voice assistant listens for a wake word (default: "hey assistant") and then processes your spoken command through the AI.
+The voice mode listens for a configurable wake word (default: "hey whatsapp") and processes spoken commands through the AI with full tool access.
 
 **Settings** (configurable in the browser UI):
-- **Assistant Name** — What you want to call it
-- **Wake Word** — Trigger phrase (e.g., "hey assistant", "ok computer")
+- **Assistant Name** — Give it a name (e.g., Jarvis, Friday)
+- **Wake Word** — Trigger phrase (e.g., "hey whatsapp", "ok jarvis")
 - **STT Engine** — Google Web Speech, Apple On-Device, or Whisper
-- **TTS Voice** — Any macOS voice
+- **TTS Voice** — Any macOS system voice
 - **Auto-listen** — Keep listening after responding
 
 ## Requirements
@@ -83,8 +92,8 @@ The voice assistant listens for a wake word (default: "hey assistant") and then 
 ~/.wa/                          # Installation directory
 ├── app/                        # Git clone of this repo
 │   ├── app/                    # Python FastAPI backend
-│   │   ├── main.py             # Server + UI
-│   │   ├── agent.py            # AI agent with tool calling
+│   │   ├── main.py             # Server + embedded UI
+│   │   ├── agent.py            # LLM agent with tool calling
 │   │   ├── tools.py            # WhatsApp tools (search, send, etc.)
 │   │   ├── db.py               # SQLite database access
 │   │   ├── config.py           # Configuration
@@ -92,7 +101,7 @@ The voice assistant listens for a wake word (default: "hey assistant") and then 
 │   │   └── settings.py         # User settings
 │   ├── bridge/                 # Node.js WhatsApp bridge (Baileys)
 │   │   └── src/server.ts       # Express API for WhatsApp Web
-│   ├── voice/                  # Voice assistant
+│   ├── voice/                  # Voice mode
 │   │   ├── assistant.py        # Main voice loop
 │   │   └── apple_stt.swift     # Native macOS speech-to-text
 │   ├── launcher/               # CLI and menu bar

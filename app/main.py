@@ -18,7 +18,7 @@ from app.settings import get_settings, update_settings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="WhatsApp Assistant", version="0.2.0")
+app = FastAPI(title="WhatsApp MCP", version="0.2.0")
 
 # In-memory conversation store (per session)
 conversations: dict[str, list[dict]] = {}
@@ -256,7 +256,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>WhatsApp Assistant</title>
+<title>WhatsApp MCP</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
@@ -716,7 +716,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <svg viewBox="0 0 24 24"><path d="M17.498 14.382c-.301-.15-1.767-.867-2.04-.966-.273-.101-.473-.15-.673.15-.197.295-.771.964-.944 1.162-.175.195-.349.21-.646.075-.3-.15-1.263-.465-2.403-1.485-.888-.795-1.484-1.77-1.66-2.07-.174-.3-.019-.465.13-.615.136-.135.301-.345.451-.523.146-.181.194-.301.297-.496.1-.21.049-.375-.025-.524-.075-.15-.672-1.62-.922-2.206-.24-.584-.487-.51-.672-.51-.172-.015-.371-.015-.571-.015-.2 0-.523.074-.797.359-.273.3-1.045 1.02-1.045 2.475s1.07 2.865 1.219 3.075c.149.195 2.105 3.195 5.1 4.485.714.3 1.27.48 1.704.629.714.227 1.365.195 1.88.121.574-.091 1.767-.721 2.016-1.426.255-.691.255-1.29.18-1.425-.074-.135-.27-.21-.57-.345z"/><path d="M20.52 3.449C12.831-3.984.106 1.407.101 11.893c0 2.096.549 4.14 1.595 5.945L0 24l6.335-1.652c7.905 4.27 17.661-1.4 17.665-10.449 0-2.8-1.092-5.434-3.08-7.406l-.4-.044zm-8.52 18.2c-1.792 0-3.546-.48-5.076-1.385l-.363-.216-3.776.99 1.008-3.676-.235-.374A9.846 9.846 0 012.1 11.893C2.1 6.443 6.543 2.001 12 2.001c2.647 0 5.133 1.03 7.002 2.899a9.825 9.825 0 012.898 6.993c-.003 5.45-4.437 9.756-9.9 9.756z"/></svg>
   </div>
   <div class="info">
-    <h2>WhatsApp Assistant</h2>
+    <h2>WhatsApp MCP</h2>
     <div class="status-row">
       <div class="status-dot" id="status-dot"></div>
       <p id="status-text">online</p>
@@ -749,7 +749,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="welcome-icon">
         <svg viewBox="0 0 24 24"><path d="M17.498 14.382c-.301-.15-1.767-.867-2.04-.966-.273-.101-.473-.15-.673.15-.197.295-.771.964-.944 1.162-.175.195-.349.21-.646.075-.3-.15-1.263-.465-2.403-1.485-.888-.795-1.484-1.77-1.66-2.07-.174-.3-.019-.465.13-.615.136-.135.301-.345.451-.523.146-.181.194-.301.297-.496.1-.21.049-.375-.025-.524-.075-.15-.672-1.62-.922-2.206-.24-.584-.487-.51-.672-.51-.172-.015-.371-.015-.571-.015-.2 0-.523.074-.797.359-.273.3-1.045 1.02-1.045 2.475s1.07 2.865 1.219 3.075c.149.195 2.105 3.195 5.1 4.485.714.3 1.27.48 1.704.629.714.227 1.365.195 1.88.121.574-.091 1.767-.721 2.016-1.426.255-.691.255-1.29.18-1.425-.074-.135-.27-.21-.57-.345z"/><path d="M20.52 3.449C12.831-3.984.106 1.407.101 11.893c0 2.096.549 4.14 1.595 5.945L0 24l6.335-1.652c7.905 4.27 17.661-1.4 17.665-10.449 0-2.8-1.092-5.434-3.08-7.406l-.4-.044zm-8.52 18.2c-1.792 0-3.546-.48-5.076-1.385l-.363-.216-3.776.99 1.008-3.676-.235-.374A9.846 9.846 0 012.1 11.893C2.1 6.443 6.543 2.001 12 2.001c2.647 0 5.133 1.03 7.002 2.899a9.825 9.825 0 012.898 6.993c-.003 5.45-4.437 9.756-9.9 9.756z"/></svg>
       </div>
-      <h3>WhatsApp Assistant</h3>
+      <h3>WhatsApp MCP</h3>
       <div class="feature-badge">
         <svg viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1s3.1 1.39 3.1 3.1v2z"/></svg>
         Read &middot; Send &middot; Schedule &middot; Summarize
@@ -796,11 +796,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </h3>
     <div class="s-group">
       <label>Assistant Name</label>
-      <input type="text" id="s-assistant-name" placeholder="Assistant">
+      <input type="text" id="s-assistant-name" placeholder="e.g. Jarvis, Friday...">
     </div>
     <div class="s-group">
       <label>Wake Word</label>
-      <input type="text" id="s-wake-word" placeholder="hey assistant">
+      <input type="text" id="s-wake-word" placeholder="hey whatsapp">
     </div>
     <div class="s-group">
       <label>STT Engine</label>
@@ -855,7 +855,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <div class="input-area">
   <div class="input-wrapper">
-    <textarea id="input" rows="1" placeholder="Message WhatsApp Assistant..." autofocus></textarea>
+    <textarea id="input" rows="1" placeholder="Message WhatsApp MCP..." autofocus></textarea>
   </div>
   <button class="send-btn" id="send-btn" onclick="sendMessage()">
     <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
@@ -1046,8 +1046,8 @@ async function openSettings(){
   try {
     const r = await fetch('/api/settings');
     const s = await r.json();
-    document.getElementById('s-assistant-name').value = s.assistant_name || 'Assistant';
-    document.getElementById('s-wake-word').value = s.wake_word || 'hey assistant';
+    document.getElementById('s-assistant-name').value = s.assistant_name || '';
+    document.getElementById('s-wake-word').value = s.wake_word || 'hey whatsapp';
     document.getElementById('s-stt-engine').value = s.stt_engine || 'google';
     sSpeed.value = s.tts_speed || 190;
     sSpeedVal.textContent = sSpeed.value;
@@ -1092,8 +1092,8 @@ async function testTTS(){
 
 async function saveSettings(){
   const data = {
-    assistant_name: document.getElementById('s-assistant-name').value.trim() || 'Assistant',
-    wake_word: document.getElementById('s-wake-word').value.trim() || 'hey assistant',
+    assistant_name: document.getElementById('s-assistant-name').value.trim(),
+    wake_word: document.getElementById('s-wake-word').value.trim() || 'hey whatsapp',
     stt_engine: document.getElementById('s-stt-engine').value,
     tts_voice: document.getElementById('s-tts-voice').value,
     tts_speed: parseInt(sSpeed.value),

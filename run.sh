@@ -1,5 +1,5 @@
 #!/bin/bash
-# WhatsApp Assistant — start bridge + server
+# WhatsApp MCP — start bridge + server
 
 if [ -z "$NEBIUS_API_KEY" ]; then
     echo "ERROR: NEBIUS_API_KEY environment variable is not set."

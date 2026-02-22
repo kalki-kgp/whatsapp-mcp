@@ -1,5 +1,5 @@
 #!/bin/bash
-# wa — CLI launcher for the WhatsApp Assistant
+# wa — CLI launcher for WhatsApp MCP
 # Usage: wa [command]
 #
 # Commands:
@@ -109,7 +109,7 @@ cmd_start() {
 
     # Check if already running
     if is_running server && is_running bridge; then
-        ok "WhatsApp Assistant is already running."
+        ok "WhatsApp MCP is already running."
         echo "  Server PID: $(get_pid server)"
         echo "  Bridge PID: $(get_pid bridge)"
         echo "  Open: http://$SERVER_HOST:$SERVER_PORT"
@@ -165,7 +165,7 @@ cmd_start() {
     fi
 
     echo ""
-    ok "WhatsApp Assistant is running!"
+    ok "WhatsApp MCP is running!"
     echo "  Open: http://$SERVER_HOST:$SERVER_PORT"
     echo ""
 
@@ -211,7 +211,7 @@ cmd_restart() {
 }
 
 cmd_status() {
-    echo -e "${BOLD}WhatsApp Assistant Status${NC}"
+    echo -e "${BOLD}WhatsApp MCP Status${NC}"
     echo "──────────────────────────────"
 
     for svc in server bridge voice; do
@@ -405,7 +405,7 @@ cmd_uninstall() {
 }
 
 cmd_help() {
-    echo -e "${BOLD}wa${NC} — WhatsApp Assistant"
+    echo -e "${BOLD}wa${NC} — WhatsApp MCP"
     echo ""
     echo "Usage: wa [command]"
     echo ""
@@ -419,7 +419,7 @@ cmd_help() {
     echo "  menubar        Launch menu bar controller"
     echo "  logs [svc]     Tail logs (server|bridge|voice|all)"
     echo "  update         Pull latest code + reinstall deps"
-    echo "  uninstall      Remove WhatsApp Assistant"
+    echo "  uninstall      Remove WhatsApp MCP"
     echo "  help           Show this help"
 }
 

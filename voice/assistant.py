@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Voice assistant for WhatsApp Assistant.
+Voice assistant for WhatsApp MCP.
 
 Run in a separate terminal alongside the main server (./run.sh).
-Say the wake word (default "hey assistant") followed by a command, and hear
+Say the wake word (default "hey whatsapp") followed by a command, and hear
 the assistant's spoken response via macOS TTS.
 
 Usage:
@@ -41,7 +41,7 @@ except ImportError:
 def fetch_settings(server: str) -> dict:
     """Load settings from the running server."""
     defaults = {
-        "wake_word": "hey assistant",
+        "wake_word": "hey whatsapp",
         "stt_engine": "google",
         "tts_voice": "Samantha",
         "tts_speed": 190,
@@ -327,7 +327,7 @@ STT_BACKENDS = {
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Voice assistant for WhatsApp Assistant")
+    parser = argparse.ArgumentParser(description="Voice assistant for WhatsApp MCP")
     parser.add_argument("--server", default="http://localhost:3009", help="Server URL")
     args = parser.parse_args()
     server = args.server.rstrip("/")
