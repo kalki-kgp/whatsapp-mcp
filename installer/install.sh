@@ -100,6 +100,35 @@ for pkg in python@3 node portaudio; do
     fi
 done
 
+# --- migrate from old ~/.tanu installation ---
+
+OLD_HOME="$HOME/.tanu"
+if [ -d "$OLD_HOME" ] && [ ! -d "$WA_HOME" ]; then
+    log "Migrating from ~/.tanu to ~/.wa..."
+    # Stop old services
+    if command -v tanu &>/dev/null; then
+        tanu stop 2>/dev/null || true
+    fi
+    mv "$OLD_HOME" "$WA_HOME"
+    # Remove old symlink
+    rm -f /usr/local/bin/tanu 2>/dev/null || true
+    rm -f "$HOME/.local/bin/tanu" 2>/dev/null || true
+    # Remove old LaunchAgent
+    rm -f ~/Library/LaunchAgents/com.tanu.*.plist 2>/dev/null || true
+    ok "Migrated ~/.tanu → ~/.wa"
+elif [ -d "$OLD_HOME" ] && [ -d "$WA_HOME" ]; then
+    # Both exist — clean up old one
+    warn "Found old ~/.tanu alongside ~/.wa — removing old installation"
+    if command -v tanu &>/dev/null; then
+        tanu stop 2>/dev/null || true
+    fi
+    rm -rf "$OLD_HOME"
+    rm -f /usr/local/bin/tanu 2>/dev/null || true
+    rm -f "$HOME/.local/bin/tanu" 2>/dev/null || true
+    rm -f ~/Library/LaunchAgents/com.tanu.*.plist 2>/dev/null || true
+    ok "Cleaned up old ~/.tanu"
+fi
+
 # --- directory structure ---
 
 step "5/9  Setting up ~/.wa/..."
