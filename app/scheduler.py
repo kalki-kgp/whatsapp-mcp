@@ -36,45 +36,57 @@ def _get_db() -> sqlite3.Connection:
 
 
 def schedule_message(recipient_jid: str, recipient_name: str, message: str, send_at: str) -> dict:
-    """Schedule a message for later delivery. send_at is ISO 8601 UTC."""
+    """Schedule a message for later delivery. send_at is ISO 8601 in local or any timezone."""
     try:
         dt = datetime.fromisoformat(send_at.replace("Z", "+00:00"))
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            local_tz = datetime.now().astimezone().tzinfo
+            dt = dt.replace(tzinfo=local_tz)
     except ValueError:
         return {"success": False, "error": f"Invalid datetime format: {send_at}"}
 
-    now = datetime.now(tz=timezone.utc)
-    if dt <= now:
+    dt_utc = dt.astimezone(timezone.utc)
+    now_utc = datetime.now(tz=timezone.utc)
+    if dt_utc <= now_utc:
         return {"success": False, "error": "Scheduled time must be in the future"}
 
     with _lock:
         conn = _get_db()
         cursor = conn.execute(
             "INSERT INTO scheduled_messages (recipient_jid, recipient_name, message, send_at) VALUES (?, ?, ?, ?)",
-            (recipient_jid, recipient_name, message, dt.isoformat()),
+            (recipient_jid, recipient_name, message, dt_utc.isoformat()),
         )
         msg_id = cursor.lastrowid
         conn.commit()
         conn.close()
 
+    dt_local = dt_utc.astimezone()
     return {
         "success": True,
         "id": msg_id,
         "recipient_name": recipient_name,
-        "send_at": dt.isoformat(),
+        "send_at": dt_local.isoformat(),
     }
 
 
 def list_scheduled() -> list[dict]:
-    """List all pending scheduled messages."""
+    """List all pending scheduled messages with times in local timezone."""
     with _lock:
         conn = _get_db()
         rows = conn.execute(
             "SELECT id, recipient_jid, recipient_name, message, send_at, status FROM scheduled_messages WHERE status = 'pending' ORDER BY send_at ASC"
         ).fetchall()
         conn.close()
-    return [dict(row) for row in rows]
+    results = []
+    for row in rows:
+        d = dict(row)
+        try:
+            dt_utc = datetime.fromisoformat(d["send_at"])
+            d["send_at"] = dt_utc.astimezone().isoformat()
+        except (ValueError, KeyError):
+            pass
+        results.append(d)
+    return results
 
 
 def cancel_scheduled(message_id: int) -> dict:
@@ -96,15 +108,23 @@ def cancel_scheduled(message_id: int) -> dict:
 
 def _send_due_messages() -> None:
     """Check for and send any due messages."""
-    now = datetime.now(tz=timezone.utc)
+    now_utc = datetime.now(tz=timezone.utc)
 
     with _lock:
         conn = _get_db()
-        rows = conn.execute(
-            "SELECT id, recipient_jid, recipient_name, message FROM scheduled_messages WHERE status = 'pending' AND send_at <= ?",
-            (now.isoformat(),),
+        pending = conn.execute(
+            "SELECT id, recipient_jid, recipient_name, message, send_at FROM scheduled_messages WHERE status = 'pending'"
         ).fetchall()
         conn.close()
+
+    rows = []
+    for row in pending:
+        try:
+            send_dt = datetime.fromisoformat(row["send_at"])
+            if send_dt.astimezone(timezone.utc) <= now_utc:
+                rows.append(row)
+        except (ValueError, TypeError):
+            rows.append(row)
 
     for row in rows:
         msg_id = row["id"]

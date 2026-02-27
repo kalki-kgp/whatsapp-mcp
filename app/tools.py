@@ -363,7 +363,7 @@ TOOL_DEFINITIONS = [
                 "Schedule a WhatsApp message to be sent at a future time. "
                 "IMPORTANT: Same rules as send_message — you MUST show the user a draft and get confirmation first. "
                 "The recipient_jid and recipient_name MUST come from search_contacts. "
-                "The send_at time must be in ISO 8601 format (UTC)."
+                "The send_at time must be in ISO 8601 format using the user's LOCAL timezone (not UTC)."
             ),
             "parameters": {
                 "type": "object",
@@ -382,7 +382,7 @@ TOOL_DEFINITIONS = [
                     },
                     "send_at": {
                         "type": "string",
-                        "description": "When to send the message, in ISO 8601 UTC format (e.g., '2025-03-15T09:00:00+00:00')",
+                        "description": "When to send the message, in ISO 8601 format using the user's local timezone (e.g., '2025-03-15T09:00:00'). Naive datetimes (no offset) are treated as local time.",
                     },
                 },
                 "required": ["recipient_jid", "recipient_name", "message", "send_at"],

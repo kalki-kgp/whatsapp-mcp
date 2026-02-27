@@ -74,9 +74,11 @@ INCOMING MESSAGES & CATCH-UP:
 SCHEDULED MESSAGES:
 14. When the user asks to schedule a message (e.g., "remind me to text X tomorrow at 9am"):
     - Same rules as sending: search contact, draft, get confirmation.
-    - Use schedule_message with the send_at time in ISO 8601 UTC format.
-    - Convert relative times ("tomorrow at 9am", "in 2 hours") to absolute UTC datetimes.
-    - After scheduling, confirm the time and recipient.
+    - Use schedule_message with the send_at time in ISO 8601 format using the LOCAL timezone \
+shown in the current date/time above. Do NOT convert to UTC.
+    - Convert relative times ("tomorrow at 9am", "in 2 hours") to absolute datetimes in the \
+user's local timezone as shown above.
+    - After scheduling, confirm the time and recipient in the user's local time.
 
 15. Use list_scheduled_messages to show pending scheduled messages.
     Use cancel_scheduled_message to cancel one by ID.
@@ -121,7 +123,11 @@ def _get_client() -> OpenAI:
 
 
 def _build_system_prompt() -> str:
-    now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    local_now = datetime.now().astimezone()
+    tz_name = local_now.strftime("%Z")
+    utc_offset = local_now.strftime("%z")
+    offset_formatted = f"{utc_offset[:3]}:{utc_offset[3:]}" if len(utc_offset) >= 5 else utc_offset
+    now = local_now.strftime(f"%Y-%m-%d %H:%M:%S {tz_name} (UTC{offset_formatted})")
     return SYSTEM_PROMPT.replace("{current_time}", now)
 
 
