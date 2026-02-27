@@ -32,3 +32,6 @@ SCHEDULED_DB = Path("/tmp/whatsapp-assistant-db/scheduled.sqlite")
 
 # Settings file
 SETTINGS_FILE = Path("/tmp/whatsapp-assistant-db/settings.json")
+
+# Conversations DB (chat history persistence)
+CONVERSATIONS_DB = Path("/tmp/whatsapp-assistant-db/conversations.sqlite")

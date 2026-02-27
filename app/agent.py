@@ -95,12 +95,25 @@ Rules for <tts>:
   - For short responses (confirmations, simple answers), do NOT use <tts> — the whole response will be spoken.
   - If the user explicitly asks to hear specific messages read aloud, speak those in <tts>.
 
+CONTEXT:
+17. You have access to the full conversation history including your previous tool calls \
+and their results. Use this context to avoid redundant tool calls. For example, if you \
+already searched for a contact in a previous turn, you don't need to search again unless \
+the user asks about a different contact.
+
+18. Each user request is independent unless it explicitly references a previous one. \
+When the user asks about a DIFFERENT contact or chat, ALWAYS call the tools fresh — \
+do NOT reuse data from a previous request about a different person.
+
 Available tools: search_contacts, list_recent_chats, get_messages, get_group_info, \
 search_messages, get_starred_messages, get_chat_statistics, check_whatsapp_status, \
 send_message, get_incoming_messages, get_unread_summary, schedule_message, \
 list_scheduled_messages, cancel_scheduled_message"""
 
-MAX_TOOL_ROUNDS = 10  # Safety limit on agentic loops
+MAX_TOOL_ROUNDS = 10
+MAX_TURNS_IN_CONTEXT = 15
+RECENT_TURNS_FULL = 3
+TOOL_RESULT_TRUNCATE_CHARS = 500
 
 
 def _get_client() -> OpenAI:
@@ -112,6 +125,59 @@ def _build_system_prompt() -> str:
     return SYSTEM_PROMPT.replace("{current_time}", now)
 
 
+def _split_into_turns(messages: list[dict]) -> list[list[dict]]:
+    """Group messages into turns. Each turn starts with a user message."""
+    turns: list[list[dict]] = []
+    current: list[dict] = []
+    for msg in messages:
+        if msg.get("role") == "user" and current:
+            turns.append(current)
+            current = []
+        current.append(msg)
+    if current:
+        turns.append(current)
+    return turns
+
+
+def prepare_context(messages: list[dict]) -> list[dict]:
+    """
+    Manage context window by:
+    1. Limiting total turns to MAX_TURNS_IN_CONTEXT
+    2. Truncating tool results in older turns to save tokens
+    """
+    turns = _split_into_turns(messages)
+
+    if len(turns) > MAX_TURNS_IN_CONTEXT:
+        turns = turns[-MAX_TURNS_IN_CONTEXT:]
+
+    result = []
+    for i, turn in enumerate(turns):
+        turns_from_end = len(turns) - i - 1
+        for msg in turn:
+            if msg.get("role") == "tool" and turns_from_end >= RECENT_TURNS_FULL:
+                content = msg.get("content", "")
+                if len(content) > TOOL_RESULT_TRUNCATE_CHARS:
+                    result.append(
+                        {**msg, "content": content[:TOOL_RESULT_TRUNCATE_CHARS] + "\n...[truncated]..."}
+                    )
+                else:
+                    result.append(msg)
+            else:
+                result.append(msg)
+    return result
+
+
+def _clean_assistant_message(msg_dict: dict) -> dict:
+    """Strip model_dump() extras down to fields needed for persistence/replay."""
+    cleaned: dict = {"role": "assistant", "content": msg_dict.get("content")}
+    if msg_dict.get("tool_calls"):
+        cleaned["tool_calls"] = [
+            {"id": tc["id"], "type": tc["type"], "function": tc["function"]}
+            for tc in msg_dict["tool_calls"]
+        ]
+    return cleaned
+
+
 def chat(messages: list[dict], conversation_id: str | None = None) -> Generator[dict, None, None]:
     """
     Run the agent loop. Yields events:
@@ -119,14 +185,13 @@ def chat(messages: list[dict], conversation_id: str | None = None) -> Generator[
       {"type": "tool_result", "name": ..., "result": ...}
       {"type": "message", "content": ...}
       {"type": "error", "content": ...}
+      {"type": "persist", "message": ...}   ← for caller to save to store
     """
-    # Refresh DB copies at the start of each conversation turn
     refresh_db()
-
     client = _get_client()
 
-    # Prepend system message
-    full_messages = [{"role": "system", "content": _build_system_prompt()}] + messages
+    managed = prepare_context(messages)
+    full_messages = [{"role": "system", "content": _build_system_prompt()}] + managed
 
     for round_num in range(MAX_TOOL_ROUNDS):
         try:
@@ -143,10 +208,12 @@ def chat(messages: list[dict], conversation_id: str | None = None) -> Generator[
         choice = response.choices[0]
         message = choice.message
 
-        # If the model wants to call tools
         if message.tool_calls:
-            # Add assistant message with tool calls
-            full_messages.append(message.model_dump())
+            raw_msg = message.model_dump()
+            full_messages.append(raw_msg)
+
+            cleaned = _clean_assistant_message(raw_msg)
+            yield {"type": "persist", "message": cleaned}
 
             for tool_call in message.tool_calls:
                 func_name = tool_call.function.name
@@ -157,45 +224,46 @@ def chat(messages: list[dict], conversation_id: str | None = None) -> Generator[
 
                 yield {"type": "tool_call", "name": func_name, "arguments": func_args}
 
-                # Execute the tool
                 result = execute_tool(func_name, func_args)
 
                 yield {"type": "tool_result", "name": func_name, "result": result}
 
-                # Add tool result to conversation
-                full_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": result,
-                    }
-                )
+                tool_msg = {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                }
+                full_messages.append(tool_msg)
+                yield {"type": "persist", "message": tool_msg}
 
-            # Continue the loop — the model may want to call more tools or give a final answer
             continue
 
-        # No tool calls — this is the final response
         content = message.content or ""
         yield {"type": "message", "content": content}
         return
 
-    # Exceeded max rounds
-    yield {"type": "message", "content": "I've reached the maximum number of tool calls. Here's what I found so far — please try a more specific question if you need more details."}
+    yield {
+        "type": "message",
+        "content": "I've reached the maximum number of tool calls. "
+        "Here's what I found so far — please try a more specific question if you need more details.",
+    }
 
 
 def chat_sync(messages: list[dict]) -> dict:
     """
     Synchronous version that collects all events and returns the final result.
-    Returns {"response": str, "tool_calls": list}
+    Returns {"response": str, "tool_calls": list, "persist_messages": list}
     """
     tool_calls = []
     final_response = ""
+    persist_messages = []
 
     for event in chat(messages):
-        if event["type"] == "tool_call":
+        if event["type"] == "persist":
+            persist_messages.append(event["message"])
+        elif event["type"] == "tool_call":
             tool_calls.append({"name": event["name"], "arguments": event["arguments"]})
         elif event["type"] == "tool_result":
-            # Find matching tool call and attach result
             for tc in tool_calls:
                 if tc["name"] == event["name"] and "result" not in tc:
                     tc["result"] = event["result"]
@@ -205,4 +273,8 @@ def chat_sync(messages: list[dict]) -> dict:
         elif event["type"] == "error":
             final_response = event["content"]
 
-    return {"response": final_response, "tool_calls": tool_calls}
+    return {
+        "response": final_response,
+        "tool_calls": tool_calls,
+        "persist_messages": persist_messages,
+    }

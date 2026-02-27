@@ -1,27 +1,23 @@
 import json
 import logging
 import subprocess
-import uuid
 from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 
 from app.agent import chat, chat_sync
 from app.db import refresh_db
 from app.config import SERVER_PORT, BRIDGE_URL
 from app.scheduler import start_scheduler, list_scheduled
 from app.settings import get_settings, update_settings
+from app import store
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="WhatsApp MCP", version="0.2.0")
-
-# In-memory conversation store (per session)
-conversations: dict[str, list[dict]] = {}
+app = FastAPI(title="WhatsApp MCP", version="0.3.0")
 
 # Voice event stream — voice assistant pushes events here, UI polls them
 voice_events: list[dict] = []
@@ -30,6 +26,7 @@ voice_event_id: int = 0
 
 @app.on_event("startup")
 async def startup_event():
+    store.init_db()
     start_scheduler()
 
 
@@ -43,27 +40,71 @@ async def index():
     return HTML_PAGE
 
 
+# ---------------------------------------------------------------------------
+# Conversation CRUD
+# ---------------------------------------------------------------------------
+
+@app.get("/api/conversations")
+async def api_list_conversations():
+    return {"conversations": store.list_conversations()}
+
+
+@app.post("/api/conversations")
+async def api_create_conversation(request: Request):
+    body = await request.json()
+    title = body.get("title", "New Chat")
+    conv_id = store.create_conversation(title)
+    return {"id": conv_id, "title": title}
+
+
+@app.get("/api/conversations/{conv_id}")
+async def api_get_conversation(conv_id: str):
+    if not store.conversation_exists(conv_id):
+        return {"error": "Not found"}, 404
+    messages = store.get_messages(conv_id)
+    return {"conversation_id": conv_id, "messages": messages}
+
+
+@app.delete("/api/conversations/{conv_id}")
+async def api_delete_conversation(conv_id: str):
+    store.delete_conversation(conv_id)
+    return {"status": "ok"}
+
+
+@app.patch("/api/conversations/{conv_id}")
+async def api_rename_conversation(conv_id: str, request: Request):
+    body = await request.json()
+    title = body.get("title", "").strip()
+    if title:
+        store.rename_conversation(conv_id, title)
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Chat endpoints (now backed by store)
+# ---------------------------------------------------------------------------
+
 @app.post("/api/chat")
 async def api_chat(request: Request):
     """Chat endpoint. Accepts {"message": str, "conversation_id": str?}"""
     body = await request.json()
     user_message = body.get("message", "").strip()
-    conv_id = body.get("conversation_id") or str(uuid.uuid4())
+    conv_id = body.get("conversation_id")
 
     if not user_message:
         return {"error": "Empty message"}
 
-    # Get or create conversation
-    if conv_id not in conversations:
-        conversations[conv_id] = []
+    if not conv_id or not store.conversation_exists(conv_id):
+        conv_id = store.create_conversation(store.auto_title(user_message))
 
-    conversations[conv_id].append({"role": "user", "content": user_message})
+    store.save_message(conv_id, {"role": "user", "content": user_message})
+    history = store.get_messages(conv_id)
 
-    # Run agent
-    result = chat_sync(conversations[conv_id])
+    result = chat_sync(history)
 
-    # Add assistant response to history
-    conversations[conv_id].append({"role": "assistant", "content": result["response"]})
+    store.save_messages(conv_id, result.get("persist_messages", []))
+    if result["response"]:
+        store.save_message(conv_id, {"role": "assistant", "content": result["response"]})
 
     return {
         "conversation_id": conv_id,
@@ -77,26 +118,32 @@ async def api_chat_stream(request: Request):
     """Streaming chat endpoint. Returns SSE events."""
     body = await request.json()
     user_message = body.get("message", "").strip()
-    conv_id = body.get("conversation_id") or str(uuid.uuid4())
+    conv_id = body.get("conversation_id")
 
     if not user_message:
         return {"error": "Empty message"}
 
-    if conv_id not in conversations:
-        conversations[conv_id] = []
+    is_new = not conv_id or not store.conversation_exists(conv_id)
+    if is_new:
+        conv_id = store.create_conversation(store.auto_title(user_message))
 
-    conversations[conv_id].append({"role": "user", "content": user_message})
+    store.save_message(conv_id, {"role": "user", "content": user_message})
+    history = store.get_messages(conv_id)
 
     def generate():
-        yield f"data: {json.dumps({'type': 'conv_id', 'conversation_id': conv_id})}\n\n"
+        yield f"data: {json.dumps({'type': 'conv_id', 'conversation_id': conv_id, 'is_new': is_new})}\n\n"
         final_content = ""
-        for event in chat(conversations[conv_id]):
-            yield f"data: {json.dumps(event)}\n\n"
-            if event["type"] == "message":
-                final_content = event["content"]
-        # Save assistant response
+
+        for event in chat(history):
+            if event["type"] == "persist":
+                store.save_message(conv_id, event["message"])
+            else:
+                yield f"data: {json.dumps(event)}\n\n"
+                if event["type"] == "message":
+                    final_content = event["content"]
+
         if final_content:
-            conversations[conv_id].append({"role": "assistant", "content": final_content})
+            store.save_message(conv_id, {"role": "assistant", "content": final_content})
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
@@ -109,20 +156,12 @@ async def api_refresh():
     return {"status": "ok", "message": "Database copies refreshed"}
 
 
-@app.delete("/api/conversation/{conv_id}")
-async def clear_conversation(conv_id: str):
-    """Clear a conversation's history."""
-    conversations.pop(conv_id, None)
-    return {"status": "ok"}
-
-
 # ---------------------------------------------------------------------------
 # Bridge proxy endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/api/bridge/status")
 async def bridge_status():
-    """Proxy to WhatsApp bridge status endpoint."""
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{BRIDGE_URL}/api/status", timeout=5)
@@ -135,7 +174,6 @@ async def bridge_status():
 
 @app.get("/api/bridge/qr")
 async def bridge_qr():
-    """Proxy to WhatsApp bridge QR code endpoint."""
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{BRIDGE_URL}/api/qr", timeout=5)
@@ -148,7 +186,6 @@ async def bridge_qr():
 
 @app.get("/api/bridge/incoming")
 async def bridge_incoming(since: int = 0):
-    """Proxy to bridge incoming messages endpoint."""
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{BRIDGE_URL}/api/incoming", params={"since": since}, timeout=5)
@@ -161,7 +198,6 @@ async def bridge_incoming(since: int = 0):
 
 @app.get("/api/scheduled")
 async def api_scheduled():
-    """Get pending scheduled messages."""
     messages = list_scheduled()
     return {"scheduled_messages": messages, "count": len(messages)}
 
@@ -172,13 +208,11 @@ async def api_scheduled():
 
 @app.get("/api/settings")
 async def api_get_settings():
-    """Return current settings."""
     return get_settings()
 
 
 @app.put("/api/settings")
 async def api_put_settings(request: Request):
-    """Partial update of settings."""
     body = await request.json()
     updated = update_settings(body)
     return updated
@@ -186,14 +220,12 @@ async def api_put_settings(request: Request):
 
 @app.get("/api/tts-voices")
 async def api_tts_voices():
-    """Return list of available macOS TTS voices via `say -v ?`."""
     try:
         result = subprocess.run(
             ["say", "-v", "?"], capture_output=True, text=True, timeout=5
         )
         voices = []
         for line in result.stdout.strip().splitlines():
-            # Format: "Name       lang_REGION  # Sample text"
             parts = line.split("#", 1)
             name_lang = parts[0].strip()
             tokens = name_lang.split()
@@ -208,7 +240,6 @@ async def api_tts_voices():
 
 @app.post("/api/tts-test")
 async def api_tts_test(request: Request):
-    """Play a TTS sample with the given voice and speed."""
     body = await request.json()
     voice = body.get("voice", "Samantha")
     speed = body.get("speed", 190)
@@ -229,13 +260,11 @@ async def api_tts_test(request: Request):
 
 @app.post("/api/voice/event")
 async def api_voice_event(request: Request):
-    """Voice assistant pushes events here for the UI to display."""
     global voice_event_id
     body = await request.json()
     voice_event_id += 1
     body["id"] = voice_event_id
     voice_events.append(body)
-    # Keep last 200 events
     if len(voice_events) > 200:
         del voice_events[:len(voice_events) - 200]
     return {"id": voice_event_id}
@@ -243,13 +272,12 @@ async def api_voice_event(request: Request):
 
 @app.get("/api/voice/events")
 async def api_voice_events(after: int = 0):
-    """UI polls for voice events after a given ID."""
     new = [e for e in voice_events if e["id"] > after]
     return {"events": new}
 
 
 # ---------------------------------------------------------------------------
-# Inline HTML page — single-file chat UI
+# Inline HTML page — single-file chat UI with sidebar
 # ---------------------------------------------------------------------------
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -279,7 +307,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     --yellow: #ffd54f;
     --separator: #1a242c;
     --radius: 10px;
-    --toast-green: #00c896;
+    --sidebar-w: 300px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -287,53 +315,148 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: var(--bg-deep);
     color: var(--text);
     height: 100vh; height: 100dvh;
-    display: flex; flex-direction: column;
+    display: flex; flex-direction: row;
     overflow: hidden;
   }
+
+  /* ===== SIDEBAR ===== */
+  .sidebar {
+    width: var(--sidebar-w); flex-shrink: 0;
+    background: var(--bg-panel);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    z-index: 20;
+  }
+  .sidebar-head {
+    padding: 16px 16px 12px;
+    display: flex; align-items: center; gap: 10px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .sidebar-head h3 {
+    flex: 1; font-size: 15px; font-weight: 700;
+    letter-spacing: -0.2px; color: var(--text);
+  }
+  .new-chat-btn {
+    display: flex; align-items: center; gap: 5px;
+    background: var(--accent); color: var(--bg-deep);
+    border: none; border-radius: 8px;
+    padding: 7px 14px; font-size: 12px; font-weight: 600;
+    cursor: pointer; font-family: 'DM Sans', sans-serif;
+    transition: all 0.2s; white-space: nowrap;
+  }
+  .new-chat-btn:hover { background: #00e6aa; transform: translateY(-1px); }
+  .new-chat-btn svg { width: 14px; height: 14px; fill: currentColor; }
+
+  .conv-list {
+    flex: 1; overflow-y: auto; overflow-x: hidden;
+    padding: 6px 0;
+  }
+  .conv-list::-webkit-scrollbar { width: 4px; }
+  .conv-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 2px; }
+
+  .conv-item {
+    padding: 12px 16px; cursor: pointer;
+    border-left: 3px solid transparent;
+    transition: all 0.15s; position: relative;
+  }
+  .conv-item:hover { background: rgba(255,255,255,0.04); }
+  .conv-item.active {
+    background: var(--accent-dim);
+    border-left-color: var(--accent);
+  }
+  .conv-item-top { display: flex; align-items: center; gap: 8px; }
+  .conv-title {
+    flex: 1; font-size: 13px; font-weight: 500;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    color: var(--text);
+  }
+  .conv-item.active .conv-title { color: #fff; }
+  .conv-time {
+    font-size: 10px; color: var(--text-3);
+    white-space: nowrap; flex-shrink: 0;
+  }
+  .conv-preview {
+    font-size: 11px; color: var(--text-2);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    margin-top: 3px;
+  }
+  .conv-delete {
+    position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+    width: 26px; height: 26px; background: none; border: none;
+    color: var(--text-3); border-radius: 6px; cursor: pointer;
+    display: none; align-items: center; justify-content: center;
+    transition: all 0.15s;
+  }
+  .conv-item:hover .conv-delete { display: flex; }
+  .conv-delete:hover { background: rgba(239,83,80,0.15); color: var(--red); }
+  .conv-delete svg { width: 14px; height: 14px; fill: currentColor; }
+
+  .sidebar-empty {
+    padding: 40px 20px; text-align: center;
+    color: var(--text-3); font-size: 13px; line-height: 1.6;
+  }
+  .sidebar-empty svg {
+    width: 40px; height: 40px; fill: var(--text-3);
+    margin-bottom: 12px; opacity: 0.5;
+  }
+
+  /* ===== MAIN CONTENT ===== */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 
   /* ===== HEADER ===== */
   .header {
     background: var(--bg-header);
     padding: 0 20px;
     display: flex; align-items: center; gap: 14px;
-    height: 64px; flex-shrink: 0;
+    height: 56px; flex-shrink: 0;
     border-bottom: 1px solid var(--border);
     z-index: 10;
   }
+  .hamburger {
+    display: none; width: 36px; height: 36px;
+    background: none; border: none; color: var(--text-2);
+    border-radius: 8px; cursor: pointer;
+    align-items: center; justify-content: center;
+    transition: all 0.2s;
+  }
+  .hamburger:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+  .hamburger svg { width: 20px; height: 20px; fill: currentColor; }
+
   .avatar {
-    width: 42px; height: 42px;
+    width: 36px; height: 36px;
     background: linear-gradient(135deg, var(--accent), #00897b);
     border-radius: 50%;
     display: flex; align-items: center; justify-content: center;
     flex-shrink: 0;
-    box-shadow: 0 0 16px var(--accent-glow);
+    box-shadow: 0 0 12px var(--accent-glow);
   }
-  .avatar svg { width: 22px; height: 22px; fill: #fff; }
+  .avatar svg { width: 18px; height: 18px; fill: #fff; }
   .info { flex: 1; min-width: 0; }
-  .info h2 { font-size: 15px; font-weight: 600; letter-spacing: -0.2px; }
-  .status-row { display: flex; align-items: center; gap: 6px; }
+  .info h2 { font-size: 14px; font-weight: 600; letter-spacing: -0.2px; }
+  .status-row { display: flex; align-items: center; gap: 5px; }
   .status-dot {
-    width: 7px; height: 7px; border-radius: 50%;
+    width: 6px; height: 6px; border-radius: 50%;
     background: var(--accent); flex-shrink: 0;
     transition: all 0.3s;
   }
   .status-dot.busy { background: var(--yellow); animation: pulse-dot 1.4s ease-in-out infinite; }
   @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:0.3} }
-  .info p { font-size: 12px; color: var(--text-2); }
-  .header-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+  .info p { font-size: 11px; color: var(--text-2); }
+  .header-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 
   .bridge-pill {
-    display: flex; align-items: center; gap: 6px;
-    padding: 5px 12px; border-radius: 20px;
+    display: flex; align-items: center; gap: 5px;
+    padding: 4px 10px; border-radius: 20px;
     background: rgba(255,255,255,0.04);
     border: 1px solid var(--border);
-    font-size: 11px; font-weight: 500;
+    font-size: 10px; font-weight: 500;
     color: var(--text-2); cursor: pointer;
     transition: all 0.2s; white-space: nowrap;
   }
   .bridge-pill:hover { background: rgba(255,255,255,0.08); }
   .bridge-pill .bdot {
-    width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+    width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
     transition: background 0.3s;
   }
   .bdot.connected { background: var(--accent); box-shadow: 0 0 6px var(--accent-glow); }
@@ -347,7 +470,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .view-toggle button {
     background: none; border: none; color: var(--text-2);
-    padding: 5px 14px; font-size: 11px; font-weight: 600;
+    padding: 4px 12px; font-size: 10px; font-weight: 600;
     cursor: pointer; transition: all 0.2s;
     letter-spacing: 0.4px; text-transform: uppercase;
     font-family: 'DM Sans', sans-serif;
@@ -356,13 +479,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .view-toggle button:hover:not(.active) { color: var(--text); }
 
   .hbtn {
-    width: 36px; height: 36px; background: none; border: none;
+    width: 32px; height: 32px; background: none; border: none;
     color: var(--text-2); border-radius: 50%; cursor: pointer;
     display: flex; align-items: center; justify-content: center;
     transition: all 0.2s;
   }
   .hbtn:hover { background: rgba(255,255,255,0.06); color: var(--text); }
-  .hbtn svg { width: 18px; height: 18px; fill: currentColor; }
+  .hbtn svg { width: 16px; height: 16px; fill: currentColor; }
 
   /* ===== SETTINGS MODAL ===== */
   .settings-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:100; align-items:center; justify-content:center; }
@@ -393,18 +516,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .s-group input[type="text"]:focus, .s-group select:focus { border-color: rgba(0,200,150,0.4); }
   .s-group select { appearance: none; cursor: pointer; }
   .s-range-row { display: flex; align-items: center; gap: 12px; }
-  .s-range-row input[type="range"] {
-    flex: 1; accent-color: var(--accent); height: 6px; cursor: pointer;
-  }
+  .s-range-row input[type="range"] { flex: 1; accent-color: var(--accent); height: 6px; cursor: pointer; }
   .s-range-val {
     min-width: 48px; text-align: center; font-size: 13px;
     font-weight: 600; color: var(--accent);
     font-family: 'JetBrains Mono', monospace;
   }
-  .s-toggle-row {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 8px 0;
-  }
+  .s-toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; }
   .s-toggle-row span { font-size: 14px; }
   .s-toggle {
     width: 44px; height: 24px; background: var(--bg-input);
@@ -600,35 +718,35 @@ HTML_PAGE = r"""<!DOCTYPE html>
   /* ===== WELCOME ===== */
   .welcome { text-align: center; color: var(--text-2); margin: auto; max-width: 480px; padding: 24px; }
   .welcome-icon {
-    width: 80px; height: 80px;
+    width: 72px; height: 72px;
     background: linear-gradient(135deg, var(--accent-dim), rgba(79,195,247,0.08));
-    border-radius: 24px; display: flex; align-items: center; justify-content: center;
-    margin: 0 auto 24px; box-shadow: 0 0 40px var(--accent-glow);
+    border-radius: 20px; display: flex; align-items: center; justify-content: center;
+    margin: 0 auto 20px; box-shadow: 0 0 40px var(--accent-glow);
   }
-  .welcome-icon svg { width: 40px; height: 40px; fill: var(--accent); }
-  .welcome h3 { color: var(--text); font-size: 22px; font-weight: 600; margin-bottom: 8px; letter-spacing: -0.3px; }
-  .welcome p { font-size: 14px; line-height: 1.6; margin-bottom: 28px; }
+  .welcome-icon svg { width: 36px; height: 36px; fill: var(--accent); }
+  .welcome h3 { color: var(--text); font-size: 20px; font-weight: 600; margin-bottom: 6px; letter-spacing: -0.3px; }
+  .welcome p { font-size: 13px; line-height: 1.6; margin-bottom: 24px; }
   .feature-badge {
     display: inline-flex; align-items: center; gap: 6px;
     background: var(--accent-dim); border-radius: 20px;
-    padding: 6px 14px; font-size: 12px; color: var(--accent);
-    margin-bottom: 28px; font-weight: 500;
+    padding: 5px 12px; font-size: 11px; color: var(--accent);
+    margin-bottom: 24px; font-weight: 500;
   }
   .feature-badge svg { width: 14px; height: 14px; fill: var(--accent); }
   .examples { text-align: left; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .example-item {
-    background: var(--bg-msg-in); padding: 14px 16px; border-radius: var(--radius);
+    background: var(--bg-msg-in); padding: 12px 14px; border-radius: var(--radius);
     cursor: pointer; transition: all 0.2s; display: flex;
-    align-items: center; gap: 12px; font-size: 13px;
+    align-items: center; gap: 10px; font-size: 13px;
     color: var(--text); line-height: 1.4;
     border: 1px solid var(--border);
   }
   .example-item:hover { background: var(--bg-input); border-color: rgba(0,200,150,0.2); transform: translateY(-1px); }
   .example-icon {
-    width: 36px; height: 36px;
-    background: var(--accent-dim); border-radius: 10px;
+    width: 32px; height: 32px;
+    background: var(--accent-dim); border-radius: 8px;
     display: flex; align-items: center; justify-content: center;
-    flex-shrink: 0; font-size: 16px;
+    flex-shrink: 0; font-size: 15px;
   }
 
   /* ===== CONTENT FORMATTING ===== */
@@ -655,7 +773,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   /* ===== TOAST NOTIFICATIONS ===== */
   .toast-container {
-    position: fixed; top: 76px; right: 20px;
+    position: fixed; top: 68px; right: 20px;
     z-index: 90; display: flex; flex-direction: column; gap: 8px;
     pointer-events: none;
   }
@@ -700,18 +818,50 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .modal-btn:hover { background: var(--bg-header); }
 
-  /* ===== RESPONSIVE ===== */
+  /* ===== MOBILE SIDEBAR ===== */
+  .sidebar-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,0.5); z-index: 19;
+  }
   @media (max-width: 768px) {
+    .sidebar {
+      position: fixed; left: 0; top: 0; bottom: 0;
+      transform: translateX(-100%);
+      transition: transform 0.3s cubic-bezier(0.16,1,0.3,1);
+      z-index: 50;
+    }
+    .sidebar.open { transform: translateX(0); }
+    .sidebar-overlay.active { display: block; z-index: 49; }
+    .hamburger { display: flex; }
     .messages { padding: 12px 14px 8px; }
     .msg { max-width: 88%; }
     .examples { grid-template-columns: 1fr; }
     .header { padding: 0 12px; }
-    .view-toggle button { padding: 5px 10px; font-size: 10px; }
+    .view-toggle button { padding: 4px 10px; font-size: 9px; }
   }
 </style>
 </head>
 <body>
+
+<!-- SIDEBAR -->
+<div class="sidebar" id="sidebar">
+  <div class="sidebar-head">
+    <h3>Chats</h3>
+    <button class="new-chat-btn" onclick="newChat()">
+      <svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+      New
+    </button>
+  </div>
+  <div class="conv-list" id="conv-list"></div>
+</div>
+<div class="sidebar-overlay" id="sidebar-overlay" onclick="toggleSidebar()"></div>
+
+<!-- MAIN -->
+<div class="main">
 <div class="header">
+  <button class="hamburger" onclick="toggleSidebar()">
+    <svg viewBox="0 0 24 24"><path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/></svg>
+  </button>
   <div class="avatar">
     <svg viewBox="0 0 24 24"><path d="M17.498 14.382c-.301-.15-1.767-.867-2.04-.966-.273-.101-.473-.15-.673.15-.197.295-.771.964-.944 1.162-.175.195-.349.21-.646.075-.3-.15-1.263-.465-2.403-1.485-.888-.795-1.484-1.77-1.66-2.07-.174-.3-.019-.465.13-.615.136-.135.301-.345.451-.523.146-.181.194-.301.297-.496.1-.21.049-.375-.025-.524-.075-.15-.672-1.62-.922-2.206-.24-.584-.487-.51-.672-.51-.172-.015-.371-.015-.571-.015-.2 0-.523.074-.797.359-.273.3-1.045 1.02-1.045 2.475s1.07 2.865 1.219 3.075c.149.195 2.105 3.195 5.1 4.485.714.3 1.27.48 1.704.629.714.227 1.365.195 1.88.121.574-.091 1.767-.721 2.016-1.426.255-.691.255-1.29.18-1.425-.074-.135-.27-.21-.57-.345z"/><path d="M20.52 3.449C12.831-3.984.106 1.407.101 11.893c0 2.096.549 4.14 1.595 5.945L0 24l6.335-1.652c7.905 4.27 17.661-1.4 17.665-10.449 0-2.8-1.092-5.434-3.08-7.406l-.4-.044zm-8.52 18.2c-1.792 0-3.546-.48-5.076-1.385l-.363-.216-3.776.99 1.008-3.676-.235-.374A9.846 9.846 0 012.1 11.893C2.1 6.443 6.543 2.001 12 2.001c2.647 0 5.133 1.03 7.002 2.899a9.825 9.825 0 012.898 6.993c-.003 5.45-4.437 9.756-9.9 9.756z"/></svg>
   </div>
@@ -737,44 +887,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button class="hbtn" onclick="fetch('/api/refresh',{method:'POST'})" title="Refresh data">
       <svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
     </button>
-    <button class="hbtn" onclick="clearChat()" title="New chat">
-      <svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+    <button class="hbtn" onclick="newChat()" title="New chat">
+      <svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
     </button>
   </div>
 </div>
 
 <div class="messages-wrapper">
-  <div class="messages" id="messages">
-    <div class="welcome" id="welcome-screen">
-      <div class="welcome-icon">
-        <svg viewBox="0 0 24 24"><path d="M17.498 14.382c-.301-.15-1.767-.867-2.04-.966-.273-.101-.473-.15-.673.15-.197.295-.771.964-.944 1.162-.175.195-.349.21-.646.075-.3-.15-1.263-.465-2.403-1.485-.888-.795-1.484-1.77-1.66-2.07-.174-.3-.019-.465.13-.615.136-.135.301-.345.451-.523.146-.181.194-.301.297-.496.1-.21.049-.375-.025-.524-.075-.15-.672-1.62-.922-2.206-.24-.584-.487-.51-.672-.51-.172-.015-.371-.015-.571-.015-.2 0-.523.074-.797.359-.273.3-1.045 1.02-1.045 2.475s1.07 2.865 1.219 3.075c.149.195 2.105 3.195 5.1 4.485.714.3 1.27.48 1.704.629.714.227 1.365.195 1.88.121.574-.091 1.767-.721 2.016-1.426.255-.691.255-1.29.18-1.425-.074-.135-.27-.21-.57-.345z"/><path d="M20.52 3.449C12.831-3.984.106 1.407.101 11.893c0 2.096.549 4.14 1.595 5.945L0 24l6.335-1.652c7.905 4.27 17.661-1.4 17.665-10.449 0-2.8-1.092-5.434-3.08-7.406l-.4-.044zm-8.52 18.2c-1.792 0-3.546-.48-5.076-1.385l-.363-.216-3.776.99 1.008-3.676-.235-.374A9.846 9.846 0 012.1 11.893C2.1 6.443 6.543 2.001 12 2.001c2.647 0 5.133 1.03 7.002 2.899a9.825 9.825 0 012.898 6.993c-.003 5.45-4.437 9.756-9.9 9.756z"/></svg>
-      </div>
-      <h3>WhatsApp MCP</h3>
-      <div class="feature-badge">
-        <svg viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1s3.1 1.39 3.1 3.1v2z"/></svg>
-        Read &middot; Send &middot; Schedule &middot; Summarize
-      </div>
-      <p>Search contacts, read conversations, send messages, schedule deliveries, and get AI-powered summaries. Everything stays on your device.</p>
-      <div class="examples">
-        <div class="example-item" onclick="askExample(this.querySelector('.et').textContent)">
-          <div class="example-icon">&#128172;</div>
-          <span class="et">Catch me up on unread messages</span>
-        </div>
-        <div class="example-item" onclick="askExample(this.querySelector('.et').textContent)">
-          <div class="example-icon">&#128269;</div>
-          <span class="et">Find contact Priya and show our chat</span>
-        </div>
-        <div class="example-item" onclick="askExample(this.querySelector('.et').textContent)">
-          <div class="example-icon">&#128228;</div>
-          <span class="et">Send a message to Krishna saying hi</span>
-        </div>
-        <div class="example-item" onclick="askExample(this.querySelector('.et').textContent)">
-          <div class="example-icon">&#9200;</div>
-          <span class="et">Schedule a birthday wish tomorrow at midnight</span>
-        </div>
-      </div>
-    </div>
-  </div>
+  <div class="messages" id="messages"></div>
 </div>
 
 <div class="toast-container" id="toast-container"></div>
@@ -861,15 +981,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
   </button>
 </div>
+</div><!-- /main -->
 
 <script>
+// ===== STATE =====
 let conversationId = null, sending = false, currentView = 'user';
+let conversationsList = [];
 const M = document.getElementById('messages');
 const I = document.getElementById('input');
 const SB = document.getElementById('send-btn');
 const ST = document.getElementById('status-text');
 const SD = document.getElementById('status-dot');
 
+// ===== STATUS PHRASES =====
 const phrases = {
   c:['Connecting...','Syncing...','Dialing in...'],
   s:['Scrolling through chats...','Browsing contacts...','Scanning conversations...','Sifting through archives...','Combing through chats...','Rummaging through messages...'],
@@ -893,6 +1017,136 @@ I.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!sending){e.pr
 I.addEventListener('input',()=>{I.style.height='auto';I.style.height=Math.min(I.scrollHeight,100)+'px';});
 function askExample(t){I.value=t;I.style.height='auto';I.style.height=Math.min(I.scrollHeight,100)+'px';sendMessage();}
 
+// ===== SIDEBAR =====
+function toggleSidebar(){
+  document.getElementById('sidebar').classList.toggle('open');
+  document.getElementById('sidebar-overlay').classList.toggle('active');
+}
+
+function relTime(iso){
+  const d=new Date(iso), now=new Date(), ms=now-d;
+  const m=Math.floor(ms/60000), h=Math.floor(ms/3600000), dy=Math.floor(ms/86400000);
+  if(m<1)return 'now';
+  if(m<60)return m+'m';
+  if(h<24)return h+'h';
+  if(dy<7)return dy+'d';
+  return d.toLocaleDateString([],{month:'short',day:'numeric'});
+}
+
+async function loadConversations(){
+  try{
+    const r=await fetch('/api/conversations');
+    const d=await r.json();
+    conversationsList=d.conversations||[];
+    renderSidebar();
+  }catch(e){console.error('Failed to load conversations',e);}
+}
+
+function renderSidebar(){
+  const cl=document.getElementById('conv-list');
+  if(conversationsList.length===0){
+    cl.innerHTML='<div class="sidebar-empty"><svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H5.17L4 17.17V4h16v12z"/><path d="M7 9h2v2H7zm4 0h2v2h-2zm4 0h2v2h-2z"/></svg>No conversations yet.<br>Start a new chat!</div>';
+    return;
+  }
+  cl.innerHTML='';
+  for(const c of conversationsList){
+    const el=document.createElement('div');
+    el.className='conv-item'+(c.id===conversationId?' active':'');
+    el.onclick=(e)=>{if(e.target.closest('.conv-delete'))return;selectConversation(c.id);};
+    el.innerHTML=`<div class="conv-item-top"><span class="conv-title">${esc(c.title)}</span><span class="conv-time">${relTime(c.updated_at)}</span></div><div class="conv-preview">${esc(c.preview||'')}</div><button class="conv-delete" onclick="deleteConversation('${c.id}',event)" title="Delete"><svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>`;
+    cl.appendChild(el);
+  }
+}
+
+async function selectConversation(id){
+  if(sending)return;
+  conversationId=id;
+  renderSidebar();
+  M.innerHTML='';
+  // Close sidebar on mobile
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebar-overlay').classList.remove('active');
+  try{
+    const r=await fetch(`/api/conversations/${id}`);
+    const d=await r.json();
+    if(d.messages&&d.messages.length>0) renderHistory(d.messages);
+    else showWelcome();
+  }catch(e){console.error('Failed to load conversation',e);showWelcome();}
+  I.focus();
+}
+
+function renderHistory(messages){
+  M.innerHTML='';
+  let pendingTC=[], pendingTR=[];
+  for(const msg of messages){
+    if(msg.role==='user'){
+      addMsg('user',msg.content);
+    } else if(msg.role==='assistant'&&msg.tool_calls&&msg.tool_calls.length>0){
+      for(const tc of msg.tool_calls){
+        pendingTC.push({name:tc.function.name,arguments:safeParse(tc.function.arguments)});
+      }
+    } else if(msg.role==='tool'){
+      pendingTR.push(msg.content||'');
+    } else if(msg.role==='assistant'){
+      addMsg('assistant',msg.content,pendingTC,pendingTR);
+      pendingTC=[];pendingTR=[];
+    }
+  }
+  M.scrollTop=M.scrollHeight;
+}
+
+function safeParse(s){try{return JSON.parse(s);}catch{return typeof s==='object'?s:{};}}
+
+function newChat(){
+  conversationId=null;
+  renderSidebar();
+  showWelcome();
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebar-overlay').classList.remove('active');
+  I.focus();
+}
+
+async function deleteConversation(id,e){
+  e.stopPropagation();
+  try{await fetch(`/api/conversations/${id}`,{method:'DELETE'});}catch{}
+  if(conversationId===id){conversationId=null;showWelcome();}
+  await loadConversations();
+}
+
+// ===== WELCOME SCREEN =====
+const WELCOME_HTML = `<div class="welcome" id="welcome-screen">
+  <div class="welcome-icon">
+    <svg viewBox="0 0 24 24"><path d="M17.498 14.382c-.301-.15-1.767-.867-2.04-.966-.273-.101-.473-.15-.673.15-.197.295-.771.964-.944 1.162-.175.195-.349.21-.646.075-.3-.15-1.263-.465-2.403-1.485-.888-.795-1.484-1.77-1.66-2.07-.174-.3-.019-.465.13-.615.136-.135.301-.345.451-.523.146-.181.194-.301.297-.496.1-.21.049-.375-.025-.524-.075-.15-.672-1.62-.922-2.206-.24-.584-.487-.51-.672-.51-.172-.015-.371-.015-.571-.015-.2 0-.523.074-.797.359-.273.3-1.045 1.02-1.045 2.475s1.07 2.865 1.219 3.075c.149.195 2.105 3.195 5.1 4.485.714.3 1.27.48 1.704.629.714.227 1.365.195 1.88.121.574-.091 1.767-.721 2.016-1.426.255-.691.255-1.29.18-1.425-.074-.135-.27-.21-.57-.345z"/><path d="M20.52 3.449C12.831-3.984.106 1.407.101 11.893c0 2.096.549 4.14 1.595 5.945L0 24l6.335-1.652c7.905 4.27 17.661-1.4 17.665-10.449 0-2.8-1.092-5.434-3.08-7.406l-.4-.044zm-8.52 18.2c-1.792 0-3.546-.48-5.076-1.385l-.363-.216-3.776.99 1.008-3.676-.235-.374A9.846 9.846 0 012.1 11.893C2.1 6.443 6.543 2.001 12 2.001c2.647 0 5.133 1.03 7.002 2.899a9.825 9.825 0 012.898 6.993c-.003 5.45-4.437 9.756-9.9 9.756z"/></svg>
+  </div>
+  <h3>WhatsApp MCP</h3>
+  <div class="feature-badge">
+    <svg viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1s3.1 1.39 3.1 3.1v2z"/></svg>
+    Read &middot; Send &middot; Schedule &middot; Summarize
+  </div>
+  <p>Search contacts, read conversations, send messages, schedule deliveries, and get AI-powered summaries.</p>
+  <div class="examples">
+    <div class="example-item" onclick="askExample(this.querySelector('.et').textContent)">
+      <div class="example-icon">&#128172;</div>
+      <span class="et">Catch me up on unread messages</span>
+    </div>
+    <div class="example-item" onclick="askExample(this.querySelector('.et').textContent)">
+      <div class="example-icon">&#128269;</div>
+      <span class="et">Find contact Priya and show our chat</span>
+    </div>
+    <div class="example-item" onclick="askExample(this.querySelector('.et').textContent)">
+      <div class="example-icon">&#128228;</div>
+      <span class="et">Send a message to Krishna saying hi</span>
+    </div>
+    <div class="example-item" onclick="askExample(this.querySelector('.et').textContent)">
+      <div class="example-icon">&#9200;</div>
+      <span class="et">Schedule a birthday wish tomorrow at midnight</span>
+    </div>
+  </div>
+</div>`;
+
+function showWelcome(){ M.innerHTML=WELCOME_HTML; }
+
+// ===== MESSAGE RENDERING =====
 function addDS(){
   if(!M.querySelector('.date-separator')){
     const s=document.createElement('div');s.className='date-separator';
@@ -918,9 +1172,9 @@ function addMsg(role,content,tc,tr){
       as.innerHTML='<div class="dev-tool-label">Args</div>';
       const ap=document.createElement('pre');ap.textContent=JSON.stringify(t.arguments,null,2);as.appendChild(ap);b.appendChild(as);
       if(tr&&tr[i]){const rs=document.createElement('div');rs.className='dev-tool-section';
-        rs.innerHTML='<div class="dev-tool-label">Result</div>';const rp=document.createElement('pre');
-        try{rp.textContent=JSON.stringify(JSON.parse(tr[i]),null,2);}catch{rp.textContent=tr[i];}
-        rs.appendChild(rp);b.appendChild(rs);}
+        rs.innerHTML='<div class="dev-tool-label">Result</div>';const rp2=document.createElement('pre');
+        try{rp2.textContent=JSON.stringify(JSON.parse(tr[i]),null,2);}catch{rp2.textContent=tr[i];}
+        rs.appendChild(rp2);b.appendChild(rs);}
       it.appendChild(h);it.appendChild(b);tp.appendChild(it);
     });
     d.appendChild(tp);
@@ -942,6 +1196,7 @@ function addTyping(){
 function updTyping(t){const e=document.getElementById('ttext');if(e)e.textContent=t;M.scrollTop=M.scrollHeight;}
 function rmTyping(){const e=document.getElementById('typing-ind');if(e)e.remove();}
 
+// ===== SEND MESSAGE =====
 async function sendMessage(){
   const t=I.value.trim();if(!t||sending)return;
   sending=true;SB.disabled=true;I.value='';I.style.height='auto';
@@ -953,7 +1208,11 @@ async function sendMessage(){
       const lines=buf.split('\n');buf=lines.pop();
       for(const l of lines){if(!l.startsWith('data: '))continue;const d=l.slice(6).trim();if(d==='[DONE]')continue;
         try{const ev=JSON.parse(d);
-          if(ev.type==='conv_id')conversationId=ev.conversation_id;
+          if(ev.type==='conv_id'){
+            const wasNew=!conversationId;
+            conversationId=ev.conversation_id;
+            if(ev.is_new||wasNew) loadConversations();
+          }
           else if(ev.type==='tool_call'){tc.push({name:ev.name,arguments:ev.arguments});ti=tc.length-1;
             updTyping(currentView==='user'?rp('s'):`Calling ${ev.name}...`);
             usd(currentView==='user'?rp('s'):`Using: ${ev.name}`);}
@@ -964,16 +1223,12 @@ async function sendMessage(){
         }catch{}}
     }
     rmTyping();stopSC();if(fc)addMsg('assistant',fc,tc,tr);
+    loadConversations();
   }catch(err){rmTyping();stopSC();addMsg('assistant',`Something went wrong: ${err.message}`);}
   sending=false;SB.disabled=false;setON();I.focus();
 }
 
-const welcomeHTML = M.innerHTML;
-function clearChat(){
-  if(conversationId)fetch(`/api/conversation/${conversationId}`,{method:'DELETE'}).catch(()=>{});
-  conversationId=null;M.innerHTML=welcomeHTML;
-}
-
+// ===== MARKDOWN =====
 function renderMD(t){if(!t)return'';let s=t.replace(/<tts>[\s\S]*?<\/tts>/g,'').trim();let h=esc(s||t);
   h=h.replace(/```([\s\S]*?)```/g,'<pre><code>$1</code></pre>');
   h=h.replace(/`([^`]+)`/g,'<code>$1</code>');
@@ -1027,7 +1282,6 @@ function showToast(sender, text, ts){
   t.onclick=()=>{I.value=`What did ${sender} say?`;I.style.height='auto';I.style.height=Math.min(I.scrollHeight,100)+'px';I.focus();t.classList.add('fade-out');setTimeout(()=>t.remove(),300);};
   TC.appendChild(t);
   setTimeout(()=>{t.classList.add('fade-out');setTimeout(()=>t.remove(),300);},8000);
-  // Keep max 3 toasts
   while(TC.children.length>3)TC.firstChild.remove();
 }
 
@@ -1057,7 +1311,6 @@ async function openSettings(){
     al.classList.toggle('on', s.auto_listen !== false);
     const sf = document.getElementById('s-sound-feedback');
     sf.classList.toggle('on', s.sound_feedback !== false);
-    // Load TTS voices
     const vr = await fetch('/api/tts-voices');
     const vd = await vr.json();
     const sel = document.getElementById('s-tts-voice');
@@ -1112,9 +1365,7 @@ let lastVoiceEventId = 0;
 let voiceTypingEl = null;
 
 function addVoiceMsg(role, content, tc) {
-  // Reuse the existing addMsg which handles formatting, tool panels, dev view, etc.
   const el = addMsg(role, content, tc || [], []);
-  // Add mic badge to the meta row to indicate this came from voice
   if (el) {
     const meta = el.querySelector('.meta-row');
     if (meta) {
@@ -1167,6 +1418,15 @@ async function pollVoiceEvents() {
 }
 
 setInterval(pollVoiceEvents, 1000);
+
+// ===== INIT =====
+loadConversations().then(()=>{
+  if(conversationsList.length>0){
+    selectConversation(conversationsList[0].id);
+  } else {
+    showWelcome();
+  }
+});
 </script>
 </body>
 </html>"""
