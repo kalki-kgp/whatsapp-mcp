@@ -83,6 +83,17 @@ user's local timezone as shown above.
 15. Use list_scheduled_messages to show pending scheduled messages.
     Use cancel_scheduled_message to cancel one by ID.
 
+BROADCAST MESSAGES:
+16. When the user asks to send the same or similar message to multiple contacts \
+(e.g., "wish happy Diwali to my top 10 contacts", "announce my new number to everyone"):
+    - Use list_recent_chats or search_contacts to find the recipients.
+    - Draft a PERSONALIZED message for each recipient — adjust tone based on the \
+relationship (formal for colleagues, casual for close friends, warm for family).
+    - Present ALL drafts to the user in a clear list and ask for confirmation.
+    - Only after confirmation, call schedule_broadcast with the full list.
+    - Messages are staggered automatically (default 45s apart) so they look natural.
+    - The send_at time should be in the user's local timezone.
+
 VOICE / TTS:
 16. The user may interact via voice. Your full response is always shown in the chat UI, \
 but a text-to-speech engine may read part of it aloud. When your response is long \
@@ -110,7 +121,7 @@ do NOT reuse data from a previous request about a different person.
 Available tools: search_contacts, list_recent_chats, get_messages, get_group_info, \
 search_messages, get_starred_messages, get_chat_statistics, check_whatsapp_status, \
 send_message, get_incoming_messages, get_unread_summary, schedule_message, \
-list_scheduled_messages, cancel_scheduled_message"""
+list_scheduled_messages, cancel_scheduled_message, schedule_broadcast"""
 
 MAX_TOOL_ROUNDS = 10
 MAX_TURNS_IN_CONTEXT = 15

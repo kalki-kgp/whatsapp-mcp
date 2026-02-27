@@ -13,6 +13,7 @@ from app.config import SERVER_PORT, BRIDGE_URL
 from app.scheduler import start_scheduler, list_scheduled
 from app.settings import get_settings, update_settings
 from app import store
+from app import rewriter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -162,6 +163,27 @@ async def api_refresh():
     """Force refresh the WhatsApp database copies."""
     refresh_db()
     return {"status": "ok", "message": "Database copies refreshed"}
+
+
+@app.post("/api/rewrite")
+async def api_rewrite(request: Request):
+    """Rewrite a message with a different tone or translate it."""
+    body = await request.json()
+    text = body.get("text", "").strip()
+    tone = body.get("tone", "formal")
+    language = body.get("language")
+
+    if not text:
+        return {"error": "Empty text"}
+    if len(text) > 2000:
+        return {"error": "Text too long (max 2000 characters)"}
+
+    try:
+        result = rewriter.rewrite(text, tone, language)
+        return {"rewritten": result, "tone": tone}
+    except Exception as e:
+        logger.error(f"Rewrite failed: {e}")
+        return {"error": "Rewrite failed"}
 
 
 # ---------------------------------------------------------------------------

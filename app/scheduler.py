@@ -3,7 +3,7 @@ import logging
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import httpx
 
@@ -104,6 +104,56 @@ def cancel_scheduled(message_id: int) -> dict:
         conn.commit()
         conn.close()
     return {"success": True, "id": message_id}
+
+
+def schedule_broadcast(recipients: list[dict], send_at: str, stagger_seconds: int = 45) -> dict:
+    """Schedule a personalized message to multiple recipients with staggered send times."""
+    if not recipients:
+        return {"success": False, "error": "No recipients provided"}
+    if len(recipients) > 50:
+        return {"success": False, "error": "Too many recipients (max 50)"}
+
+    stagger_seconds = max(15, min(stagger_seconds, 300))
+
+    try:
+        dt = datetime.fromisoformat(send_at.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            local_tz = datetime.now().astimezone().tzinfo
+            dt = dt.replace(tzinfo=local_tz)
+    except ValueError:
+        return {"success": False, "error": f"Invalid datetime format: {send_at}"}
+
+    dt_utc = dt.astimezone(timezone.utc)
+    now_utc = datetime.now(tz=timezone.utc)
+    if dt_utc <= now_utc:
+        return {"success": False, "error": "Scheduled time must be in the future"}
+
+    scheduled = []
+    with _lock:
+        conn = _get_db()
+        for i, r in enumerate(recipients):
+            jid = r.get("recipient_jid", "")
+            name = r.get("recipient_name", "")
+            message = r.get("message", "")
+            if not jid or not message:
+                continue
+            offset = timedelta(seconds=i * stagger_seconds)
+            msg_time = (dt_utc + offset).isoformat()
+            cursor = conn.execute(
+                "INSERT INTO scheduled_messages (recipient_jid, recipient_name, message, send_at) VALUES (?, ?, ?, ?)",
+                (jid, name, message, msg_time),
+            )
+            local_time = (dt_utc + offset).astimezone().isoformat()
+            scheduled.append({"id": cursor.lastrowid, "recipient_name": name, "send_at": local_time})
+        conn.commit()
+        conn.close()
+
+    return {
+        "success": True,
+        "count": len(scheduled),
+        "stagger_seconds": stagger_seconds,
+        "messages": scheduled,
+    }
 
 
 def _send_due_messages() -> None:

@@ -434,6 +434,36 @@
   .send-btn:disabled { background: var(--bg-input); cursor: not-allowed; transform: none; box-shadow: none; }
   .send-btn svg { width: 20px; height: 20px; fill: currentColor; }
 
+  /* ===== TONE BAR ===== */
+  .tone-bar {
+    display: none; padding: 4px 20px 0;
+    background: var(--bg-header); gap: 6px;
+    border-top: 1px solid var(--border);
+    align-items: center; flex-wrap: wrap;
+  }
+  .tone-bar.visible { display: flex; }
+  .tone-bar-label {
+    font-size: 10px; color: var(--text-3); font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.5px; margin-right: 2px;
+  }
+  .tone-btn {
+    background: var(--bg-input); border: 1px solid var(--border);
+    color: var(--text-2); border-radius: 16px; padding: 3px 10px;
+    font-size: 11px; font-weight: 500; cursor: pointer;
+    font-family: 'DM Sans', sans-serif; transition: all 0.2s;
+    display: flex; align-items: center; gap: 4px; white-space: nowrap;
+  }
+  .tone-btn:hover { background: var(--accent-dim); color: var(--accent); border-color: var(--accent); }
+  .tone-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .tone-btn.loading { opacity: 0.6; }
+  .tone-undo {
+    background: none; border: none; color: var(--yellow);
+    font-size: 11px; cursor: pointer; font-family: 'DM Sans', sans-serif;
+    padding: 3px 8px; display: none; font-weight: 500;
+  }
+  .tone-undo.visible { display: inline; }
+  .tone-undo:hover { text-decoration: underline; }
+
   /* ===== WELCOME ===== */
   .welcome { text-align: center; color: var(--text-2); margin: auto; max-width: 480px; padding: 24px; }
   .welcome-icon {
@@ -692,6 +722,15 @@
   </div>
 </div>
 
+<div class="tone-bar" id="tone-bar">
+  <span class="tone-bar-label">Rewrite:</span>
+  <button class="tone-btn" onclick="applyTone('formal')">&#9998; Formal</button>
+  <button class="tone-btn" onclick="applyTone('friendly')">&#128075; Friendly</button>
+  <button class="tone-btn" onclick="applyTone('shorter')">&#9986; Shorter</button>
+  <button class="tone-btn" onclick="applyTone('funnier')">&#128514; Funnier</button>
+  <button class="tone-btn" onclick="promptTranslate()">&#127760; Translate</button>
+  <button class="tone-undo" id="tone-undo" onclick="undoRewrite()">&#8617; Undo</button>
+</div>
 <div class="input-area">
   <div class="input-wrapper">
     <textarea id="input" rows="1" placeholder="Message WhatsApp MCP..." autofocus></textarea>
@@ -733,6 +772,47 @@ function setView(v){
 }
 
 I.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!sending){e.preventDefault();sendMessage();}});
+
+// ===== TONE BAR =====
+const TB = document.getElementById('tone-bar');
+const TU = document.getElementById('tone-undo');
+let originalText = '';
+
+I.addEventListener('input', () => {
+  TB.classList.toggle('visible', I.value.trim().length > 0 && !sending);
+  if (!I.value.trim()) { TU.classList.remove('visible'); originalText = ''; }
+});
+
+async function applyTone(tone, language) {
+  const text = I.value.trim();
+  if (!text || sending) return;
+  originalText = text;
+  TB.querySelectorAll('.tone-btn').forEach(b => b.disabled = true);
+  try {
+    const r = await fetch('/api/rewrite', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ text, tone, language })
+    });
+    const d = await r.json();
+    if (d.rewritten) {
+      I.value = d.rewritten;
+      I.style.height = 'auto';
+      I.style.height = Math.min(I.scrollHeight, 100) + 'px';
+      TU.classList.add('visible');
+    }
+  } catch (e) { console.error('Rewrite failed', e); }
+  TB.querySelectorAll('.tone-btn').forEach(b => b.disabled = false);
+}
+
+function undoRewrite() {
+  if (originalText) { I.value = originalText; originalText = ''; TU.classList.remove('visible');
+    I.style.height = 'auto'; I.style.height = Math.min(I.scrollHeight, 100) + 'px'; }
+}
+
+function promptTranslate() {
+  const lang = prompt('Translate to which language?');
+  if (lang) applyTone('translate', lang);
+}
 I.addEventListener('input',()=>{I.style.height='auto';I.style.height=Math.min(I.scrollHeight,100)+'px';});
 function askExample(t){I.value=t;I.style.height='auto';I.style.height=Math.min(I.scrollHeight,100)+'px';sendMessage();}
 
@@ -918,6 +998,7 @@ function rmTyping(){const e=document.getElementById('typing-ind');if(e)e.remove(
 async function sendMessage(){
   const t=I.value.trim();if(!t||sending)return;
   sending=true;SB.disabled=true;I.value='';I.style.height='auto';
+  TB.classList.remove('visible');TU.classList.remove('visible');originalText='';
   addMsg('user',t);addTyping();startSC();
   try{
     const r=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t,conversation_id:conversationId})});

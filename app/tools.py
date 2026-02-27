@@ -418,6 +418,48 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_broadcast",
+            "description": (
+                "Schedule the SAME or similar message to MULTIPLE recipients at once, with staggered send times "
+                "so they look natural (not all at once). Great for holiday wishes, announcements, event invites. "
+                "IMPORTANT: Same rules as send_message — draft ALL messages first, show the user the full list, "
+                "and get explicit confirmation before calling this tool. "
+                "Use search_contacts and list_recent_chats to find recipients first. "
+                "Personalize each message based on the relationship (formal for colleagues, casual for friends)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "recipients": {
+                        "type": "array",
+                        "description": "List of recipients with personalized messages",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "recipient_jid": {"type": "string", "description": "The EXACT JID from search_contacts"},
+                                "recipient_name": {"type": "string", "description": "Contact name from search_contacts"},
+                                "message": {"type": "string", "description": "Personalized message for this recipient"},
+                            },
+                            "required": ["recipient_jid", "recipient_name", "message"],
+                        },
+                    },
+                    "send_at": {
+                        "type": "string",
+                        "description": "When to start sending, in ISO 8601 local time (e.g., '2025-03-15T09:00:00')",
+                    },
+                    "stagger_seconds": {
+                        "type": "integer",
+                        "description": "Seconds between each message (default 45, min 15, max 300). Makes sends look natural.",
+                        "default": 45,
+                    },
+                },
+                "required": ["recipients", "send_at"],
+            },
+        },
+    },
 ]
 
 
@@ -1092,6 +1134,12 @@ def cancel_scheduled_message(message_id: int) -> str:
     return json.dumps(result)
 
 
+def schedule_broadcast_tool(recipients: list[dict], send_at: str, stagger_seconds: int = 45) -> str:
+    """Schedule a broadcast message to multiple recipients."""
+    result = scheduler.schedule_broadcast(recipients, send_at, stagger_seconds)
+    return json.dumps(result)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1191,6 +1239,7 @@ TOOL_MAP = {
     "schedule_message": schedule_message_tool,
     "list_scheduled_messages": list_scheduled_messages,
     "cancel_scheduled_message": cancel_scheduled_message,
+    "schedule_broadcast": schedule_broadcast_tool,
 }
 
 
