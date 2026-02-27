@@ -110,6 +110,8 @@ if [ -d "$OLD_HOME" ] && [ ! -d "$WA_HOME" ]; then
         tanu stop 2>/dev/null || true
     fi
     mv "$OLD_HOME" "$WA_HOME"
+    # Venv has hardcoded paths to ~/.tanu — must recreate
+    rm -rf "$VENV_DIR"
     # Remove old symlink
     rm -f /usr/local/bin/tanu 2>/dev/null || true
     rm -f "$HOME/.local/bin/tanu" 2>/dev/null || true
