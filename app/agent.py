@@ -1,5 +1,7 @@
 import json
 import logging
+import re
+import time
 from datetime import datetime, timezone
 from typing import Generator
 
@@ -124,10 +126,77 @@ search_messages, get_starred_messages, get_chat_statistics, check_whatsapp_statu
 send_message, get_incoming_messages, get_unread_summary, schedule_message, \
 list_scheduled_messages, cancel_scheduled_message, schedule_broadcast"""
 
+FAST_SYSTEM_PROMPT = """You are a helpful assistant inside a WhatsApp assistant app.
+
+Answer the user directly in normal natural language.
+Do not output JSON unless the user explicitly asks for JSON.
+Do not pretend to call tools or describe tool-call arguments.
+If the user asks for WhatsApp-specific data or actions, briefly say they should ask again after tool mode is enabled."""
+
 MAX_TOOL_ROUNDS = 10
 MAX_TURNS_IN_CONTEXT = 15
 RECENT_TURNS_FULL = 3
 TOOL_RESULT_TRUNCATE_CHARS = 500
+FAST_PATH_PATTERNS = [
+    r"^hi$",
+    r"^hello$",
+    r"^hey$",
+    r"^thanks!?$",
+    r"^thank you!?$",
+    r"^test$",
+    r"^ping$",
+    r"^who are you\??$",
+    r"^what can you do\??$",
+    r"^help$",
+    r"^help me$",
+    r"^reply with exactly\b",
+    r"^respond with exactly\b",
+    r"^say exactly\b",
+]
+WHATSAPP_QUERY_PATTERNS = [
+    r"\bwhatsapp\b",
+    r"\bcontact\b",
+    r"\bchat\b",
+    r"\bmessage(?:s)?\b",
+    r"\bunread\b",
+    r"\bincoming\b",
+    r"\bgroup\b",
+    r"\bschedule\b",
+    r"\bremind\b",
+    r"\bsend\b",
+    r"\btext\b",
+    r"\breply\b",
+    r"\bsearch\b",
+    r"\bfind\b",
+    r"\bshow\b",
+    r"\blist\b",
+    r"\bwho said\b",
+    r"\bwhat did\b",
+    r"\bwhat was i talking\b",
+    r"\btalking to\b",
+    r"\btalked to\b",
+    r"\bcatch me up\b",
+    r"\bmissed\b",
+    r"\bdelivery\b",
+    r"\bstarred\b",
+    r"\byesterday\b",
+    r"\btoday\b",
+    r"\btomorrow\b",
+    r"\btonight\b",
+    r"\blast\b",
+    r"\brecent\b",
+    r"\bago\b",
+    r"@\w+\.\w+",
+    r"\b\d{8,}\b",
+]
+CONFIRMATION_PATTERNS = [
+    r"^yes\b",
+    r"^send\b",
+    r"^go ahead\b",
+    r"^do it\b",
+    r"^okay\b",
+    r"^ok\b",
+]
 
 
 def _get_client() -> OpenAI:
@@ -143,6 +212,48 @@ def _api_message(msg: dict) -> dict:
     """Strip persisted UI metadata before sending messages to the LLM API."""
     allowed_keys = {"role", "content", "tool_calls", "tool_call_id"}
     return {key: value for key, value in msg.items() if key in allowed_keys}
+
+
+def _latest_user_message(messages: list[dict]) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            return (msg.get("content") or "").strip()
+    return ""
+
+
+def _build_fast_system_prompt() -> str:
+    local_now = datetime.now().astimezone()
+    tz_name = local_now.strftime("%Z")
+    utc_offset = local_now.strftime("%z")
+    offset_formatted = f"{utc_offset[:3]}:{utc_offset[3:]}" if len(utc_offset) >= 5 else utc_offset
+    now = local_now.strftime(f"%Y-%m-%d %H:%M:%S {tz_name} (UTC{offset_formatted})")
+    return f"{FAST_SYSTEM_PROMPT}\n\nCurrent date and time: {now}"
+
+
+def _should_use_fast_path(messages: list[dict]) -> bool:
+    latest_raw = _latest_user_message(messages).strip()
+    latest = latest_raw.lower()
+    if not latest:
+        return False
+
+    # Follow-up confirmations must stay on the tool-capable path.
+    if any(re.search(pattern, latest) for pattern in CONFIRMATION_PATTERNS):
+        return False
+
+    # If recent context already involved tools, keep the agent in tool mode.
+    recent_messages = messages[-6:]
+    if any(msg.get("role") == "tool" or msg.get("tool_calls") for msg in recent_messages):
+        return False
+
+    if any(re.search(pattern, latest) for pattern in WHATSAPP_QUERY_PATTERNS):
+        return False
+
+    # Capitalized contact-like names are a strong signal this is a WhatsApp lookup.
+    words = re.findall(r"\b[A-Z][a-z]{2,}\b", latest_raw)
+    if words:
+        return False
+
+    return any(re.search(pattern, latest) for pattern in FAST_PATH_PATTERNS)
 
 
 def _build_system_prompt() -> str:
@@ -209,6 +320,48 @@ def _clean_assistant_message(msg_dict: dict, model_name: str | None = None) -> d
     return cleaned
 
 
+def _stream_plain_response(
+    client: OpenAI,
+    messages: list[dict],
+    requested_model: str,
+) -> Generator[dict, None, None]:
+    start_time = time.perf_counter()
+    full_content: list[str] = []
+    actual_model = requested_model
+    started = False
+
+    try:
+        stream = client.chat.completions.create(
+            model=requested_model,
+            messages=messages,
+            stream=True,
+        )
+        for chunk in stream:
+            actual_model = getattr(chunk, "model", None) or actual_model
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            text = delta.content or ""
+            if text:
+                if not started:
+                    started = True
+                    yield {"type": "message_start", "model": actual_model, "mode": "fast"}
+                full_content.append(text)
+                yield {"type": "message_delta", "delta": text}
+    except Exception as e:
+        yield {"type": "error", "content": f"LLM API error: {str(e)}"}
+        return
+
+    final_content = "".join(full_content)
+    yield {
+        "type": "message",
+        "content": final_content,
+        "model": actual_model,
+        "mode": "fast",
+        "latency_ms": int((time.perf_counter() - start_time) * 1000),
+    }
+
+
 def chat(messages: list[dict], conversation_id: str | None = None) -> Generator[dict, None, None]:
     """
     Run the agent loop. Yields events:
@@ -218,11 +371,18 @@ def chat(messages: list[dict], conversation_id: str | None = None) -> Generator[
       {"type": "error", "content": ...}
       {"type": "persist", "message": ...}   ← for caller to save to store
     """
-    refresh_db()
     client = _get_client()
-
     managed = prepare_context(messages)
     full_messages = [{"role": "system", "content": _build_system_prompt()}] + managed
+
+    if _should_use_fast_path(managed):
+        requested_model = _get_model_name()
+        fast_messages = [{"role": "system", "content": _build_fast_system_prompt()}] + managed
+        yield from _stream_plain_response(client, fast_messages, requested_model)
+        return
+
+    refresh_db()
+    start_time = time.perf_counter()
 
     for round_num in range(MAX_TOOL_ROUNDS):
         requested_model = _get_model_name()
@@ -272,13 +432,21 @@ def chat(messages: list[dict], conversation_id: str | None = None) -> Generator[
             continue
 
         content = message.content or ""
-        yield {"type": "message", "content": content, "model": actual_model}
+        yield {
+            "type": "message",
+            "content": content,
+            "model": actual_model,
+            "mode": "tools",
+            "latency_ms": int((time.perf_counter() - start_time) * 1000),
+        }
         return
 
     yield {
         "type": "message",
         "content": "I've reached the maximum number of tool calls. "
         "Here's what I found so far — please try a more specific question if you need more details.",
+        "mode": "tools",
+        "latency_ms": int((time.perf_counter() - start_time) * 1000),
     }
 
 
@@ -290,6 +458,8 @@ def chat_sync(messages: list[dict]) -> dict:
     tool_calls = []
     final_response = ""
     response_model = None
+    response_mode = None
+    response_latency_ms = None
     persist_messages = []
 
     for event in chat(messages):
@@ -305,12 +475,16 @@ def chat_sync(messages: list[dict]) -> dict:
         elif event["type"] == "message":
             final_response = event["content"]
             response_model = event.get("model")
+            response_mode = event.get("mode")
+            response_latency_ms = event.get("latency_ms")
         elif event["type"] == "error":
             final_response = event["content"]
 
     return {
         "response": final_response,
         "response_model": response_model,
+        "response_mode": response_mode,
+        "response_latency_ms": response_latency_ms,
         "tool_calls": tool_calls,
         "persist_messages": persist_messages,
     }

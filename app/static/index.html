@@ -925,7 +925,11 @@ function renderHistory(messages){
     } else if(msg.role==='tool'){
       pendingTR.push(msg.content||'');
     } else if(msg.role==='assistant'){
-      addMsg('assistant',msg.content,pendingTC,pendingTR,{model:msg.model});
+      addMsg('assistant',msg.content,pendingTC,pendingTR,{
+        model:msg.model,
+        mode:msg.agent_mode,
+        latency_ms:msg.latency_ms
+      });
       pendingTC=[];pendingTR=[];
     }
   }
@@ -996,12 +1000,16 @@ function addMsg(role,content,tc,tr,meta={}){
   const c=document.createElement('div');c.className='msg-content';c.innerHTML=renderMD(content);d.appendChild(c);
   const hasTools = tc && tc.length > 0;
   const hasModel = !!meta.model;
-  if(role==='assistant' && (hasTools || hasModel)){
+  const hasMode = !!meta.mode;
+  const hasLatency = Number.isFinite(meta.latency_ms);
+  if(role==='assistant' && (hasTools || hasModel || hasMode || hasLatency)){
     const tp=document.createElement('div');tp.className='dev-tool-panel';
     tp.style.display=currentView==='dev'?'block':'none';
     const sm=document.createElement('div');sm.className='dev-tool-summary';
     const summaryBits = [];
     if (hasModel) summaryBits.push(`<span class="tcount">MODEL</span> ${esc(meta.model)}`);
+    if (hasMode) summaryBits.push(`<span class="tcount">PATH</span> ${esc(meta.mode)}`);
+    if (hasLatency) summaryBits.push(`<span class="tcount">LATENCY</span> ${(meta.latency_ms / 1000).toFixed(2)}s`);
     summaryBits.push(`<span class="tcount">${hasTools ? tc.length : 0}</span> tool${hasTools && tc.length===1 ? '' : 's'} used`);
     sm.innerHTML=summaryBits.join(' ');tp.appendChild(sm);
     (tc || []).forEach((t,i)=>{
@@ -1029,6 +1037,34 @@ function addMsg(role,content,tc,tr,meta={}){
     m.appendChild(ck);}
   d.appendChild(m);M.appendChild(d);M.scrollTop=M.scrollHeight;return d;
 }
+let activeAssistantStream = null;
+
+function startAssistantStream(meta = {}) {
+  rmTyping();
+  if (activeAssistantStream?.el) activeAssistantStream.el.remove();
+  const el = addMsg('assistant', '', [], [], meta);
+  activeAssistantStream = { el, text: '', meta };
+}
+
+function appendAssistantStream(delta) {
+  if (!activeAssistantStream) startAssistantStream();
+  activeAssistantStream.text += delta;
+  const contentEl = activeAssistantStream.el.querySelector('.msg-content');
+  if (contentEl) contentEl.innerHTML = renderMD(activeAssistantStream.text);
+  M.scrollTop = M.scrollHeight;
+}
+
+function finishAssistantStream(content, tc, tr, meta = {}) {
+  if (!activeAssistantStream) {
+    return addMsg('assistant', content, tc, tr, meta);
+  }
+  const finalText = content || activeAssistantStream.text;
+  const finalMeta = { ...activeAssistantStream.meta, ...meta };
+  activeAssistantStream.el.remove();
+  activeAssistantStream = null;
+  return addMsg('assistant', finalText, tc, tr, finalMeta);
+}
+
 function addTyping(){
   const w=document.getElementById('welcome-screen');if(w)w.remove();addDS();
   const d=document.createElement('div');d.className='typing-bubble';d.id='typing-ind';
@@ -1046,7 +1082,7 @@ async function sendMessage(){
   addMsg('user',t);addTyping();startSC();
   try{
     const r=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t,conversation_id:conversationId})});
-    const rd=r.body.getReader(),dec=new TextDecoder();let buf='',tc=[],tr=[],fc='',fm='',ti=0;
+    const rd=r.body.getReader(),dec=new TextDecoder();let buf='',tc=[],tr=[],fc='',fm='',fmode='',flat=null,ti=0;
     while(true){const{done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});
       const lines=buf.split('\n');buf=lines.pop();
       for(const l of lines){if(!l.startsWith('data: '))continue;const d=l.slice(6).trim();if(d==='[DONE]')continue;
@@ -1061,13 +1097,16 @@ async function sendMessage(){
             usd(currentView==='user'?rp('s'):`Using: ${ev.name}`);}
           else if(ev.type==='tool_result'){tr[ti]=ev.result||'';
             updTyping(currentView==='user'?rp('p'):`${ev.name} done`);}
-          else if(ev.type==='message'){fc=ev.content;fm=ev.model||'';if(currentView==='user')updTyping(rp('f'));}
+          else if(ev.type==='message_start'){startAssistantStream({model:ev.model||'',mode:ev.mode||''});}
+          else if(ev.type==='message_delta'){appendAssistantStream(ev.delta||'');if(currentView==='user')updTyping(rp('f'));}
+          else if(ev.type==='message'){fc=ev.content;fm=ev.model||'';fmode=ev.mode||'';flat=ev.latency_ms;if(currentView==='user')updTyping(rp('f'));}
           else if(ev.type==='error')fc=`Error: ${ev.content}`;
         }catch{}}
     }
-    rmTyping();stopSC();if(fc)addMsg('assistant',fc,tc,tr,{model:fm});
+    rmTyping();stopSC();
+    if(fc) finishAssistantStream(fc,tc,tr,{model:fm,mode:fmode,latency_ms:flat});
     loadConversations();
-  }catch(err){rmTyping();stopSC();addMsg('assistant',`Something went wrong: ${err.message}`);}
+  }catch(err){rmTyping();stopSC();finishAssistantStream(`Something went wrong: ${err.message}`,[],[],{});}
   sending=false;SB.disabled=false;setON();I.focus();
 }
 

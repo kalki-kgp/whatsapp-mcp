@@ -162,11 +162,18 @@ async def api_chat(request: Request):
         message = {"role": "assistant", "content": result["response"]}
         if result.get("response_model"):
             message["model"] = result["response_model"]
+        if result.get("response_mode"):
+            message["agent_mode"] = result["response_mode"]
+        if result.get("response_latency_ms") is not None:
+            message["latency_ms"] = result["response_latency_ms"]
         store.save_message(conv_id, message)
 
     return {
         "conversation_id": conv_id,
         "response": result["response"],
+        "response_model": result.get("response_model"),
+        "response_mode": result.get("response_mode"),
+        "response_latency_ms": result.get("response_latency_ms"),
         "tool_calls": result["tool_calls"],
     }
 
@@ -194,6 +201,8 @@ async def api_chat_stream(request: Request):
         yield f"data: {json.dumps({'type': 'conv_id', 'conversation_id': conv_id, 'is_new': is_new})}\n\n"
         final_content = ""
         final_model = None
+        final_mode = None
+        final_latency_ms = None
 
         for event in chat(history):
             if event["type"] == "persist":
@@ -203,11 +212,17 @@ async def api_chat_stream(request: Request):
                 if event["type"] == "message":
                     final_content = event["content"]
                     final_model = event.get("model")
+                    final_mode = event.get("mode")
+                    final_latency_ms = event.get("latency_ms")
 
         if final_content:
             message = {"role": "assistant", "content": final_content}
             if final_model:
                 message["model"] = final_model
+            if final_mode:
+                message["agent_mode"] = final_mode
+            if final_latency_ms is not None:
+                message["latency_ms"] = final_latency_ms
             store.save_message(conv_id, message)
         yield "data: [DONE]\n\n"
 
