@@ -1,5 +1,7 @@
 import makeWASocket, {
   DisconnectReason,
+  downloadMediaMessage,
+  proto,
   useMultiFileAuthState,
   WASocket,
   makeCacheableSignalKeyStore,
@@ -35,10 +37,108 @@ interface IncomingMessage {
   messageType: string;
   timestamp: number; // unix seconds
   isGroup: boolean;
+  durationSeconds?: number | null;
+  mimetype?: string | null;
 }
 
 const incomingMessages: IncomingMessage[] = [];
 const MAX_INCOMING_BUFFER = 200;
+
+interface RecentMediaMessage {
+  key: string;
+  id: string;
+  chatJid: string;
+  senderJid: string;
+  pushName: string | null;
+  timestamp: number;
+  messageType: "voice_note" | "audio";
+  durationSeconds: number | null;
+  mimetype: string | null;
+  rawMessage: proto.IWebMessageInfo;
+}
+
+const recentMediaMessages = new Map<string, RecentMediaMessage>();
+const MAX_MEDIA_BUFFER = 100;
+
+function makeMediaLookupKey(chatJid: string, participantJid: string | undefined, messageId: string): string {
+  return `${chatJid}::${participantJid || ""}::${messageId}`;
+}
+
+function getSingleQueryParam(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function findRecentMediaMessage(
+  messageId: string,
+  chatJid?: string,
+  participantJid?: string
+): RecentMediaMessage | null {
+  if (chatJid) {
+    const directKey = makeMediaLookupKey(chatJid, participantJid, messageId);
+    const directMatch = recentMediaMessages.get(directKey);
+    if (directMatch) {
+      return directMatch;
+    }
+  }
+
+  for (const item of recentMediaMessages.values()) {
+    if (item.id !== messageId) {
+      continue;
+    }
+    if (chatJid && item.chatJid !== chatJid) {
+      continue;
+    }
+    if (participantJid && item.senderJid !== participantJid) {
+      continue;
+    }
+    return item;
+  }
+
+  return null;
+}
+
+function rememberRecentMediaMessage(entry: RecentMediaMessage): void {
+  recentMediaMessages.delete(entry.key);
+  recentMediaMessages.set(entry.key, entry);
+
+  while (recentMediaMessages.size > MAX_MEDIA_BUFFER) {
+    const oldestKey = recentMediaMessages.keys().next().value;
+    if (!oldestKey) {
+      break;
+    }
+    recentMediaMessages.delete(oldestKey);
+  }
+}
+
+function unwrapMessageContent(
+  message: proto.IMessage | null | undefined
+): proto.IMessage | null | undefined {
+  let current = message;
+  while (current) {
+    if (current.ephemeralMessage?.message) {
+      current = current.ephemeralMessage.message;
+      continue;
+    }
+    if (current.viewOnceMessage?.message) {
+      current = current.viewOnceMessage.message;
+      continue;
+    }
+    if (current.viewOnceMessageV2?.message) {
+      current = current.viewOnceMessageV2.message;
+      continue;
+    }
+    if (current.viewOnceMessageV2Extension?.message) {
+      current = current.viewOnceMessageV2Extension.message;
+      continue;
+    }
+    if (current.documentWithCaptionMessage?.message) {
+      current = current.documentWithCaptionMessage.message;
+      continue;
+    }
+    break;
+  }
+  return current;
+}
 
 // --- Baileys connection ---
 async function connectToWhatsApp(): Promise<void> {
@@ -74,7 +174,10 @@ async function connectToWhatsApp(): Promise<void> {
       // Extract text content
       let text: string | null = null;
       let messageType = "unknown";
-      const m = msg.message;
+      const m = unwrapMessageContent(msg.message);
+      if (!m) {
+        continue;
+      }
       if (m.conversation) {
         text = m.conversation;
         messageType = "text";
@@ -112,12 +215,30 @@ async function connectToWhatsApp(): Promise<void> {
           ? msg.messageTimestamp
           : Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000),
         isGroup,
+        durationSeconds: m.audioMessage?.seconds || null,
+        mimetype: m.audioMessage?.mimetype || null,
       };
 
       incomingMessages.push(incoming);
       // Trim buffer
       if (incomingMessages.length > MAX_INCOMING_BUFFER) {
         incomingMessages.splice(0, incomingMessages.length - MAX_INCOMING_BUFFER);
+      }
+
+      if ((messageType === "voice_note" || messageType === "audio") && msg.key.id) {
+        const key = makeMediaLookupKey(chatJid, senderJid || undefined, msg.key.id);
+        rememberRecentMediaMessage({
+          key,
+          id: msg.key.id,
+          chatJid,
+          senderJid,
+          pushName: msg.pushName || null,
+          timestamp: incoming.timestamp,
+          messageType: messageType as "voice_note" | "audio",
+          durationSeconds: m.audioMessage?.seconds || null,
+          mimetype: m.audioMessage?.mimetype || null,
+          rawMessage: msg,
+        });
       }
 
       const preview = text ? (text.length > 50 ? text.slice(0, 50) + "..." : text) : `[${messageType}]`;
@@ -202,6 +323,76 @@ app.get("/api/incoming", (req: Request, res: Response) => {
     count: filtered.length,
     latest_timestamp: filtered.length > 0 ? filtered[filtered.length - 1].timestamp : since,
   });
+});
+
+app.get("/api/messages/:messageId", (req: Request, res: Response) => {
+  const messageId = getSingleQueryParam(req.params.messageId);
+  const chatJid = getSingleQueryParam(req.query.chatJid);
+  const participantJid = getSingleQueryParam(req.query.participantJid);
+  if (!messageId) {
+    res.status(400).json({ error: "Missing message ID" });
+    return;
+  }
+  const mediaMessage = findRecentMediaMessage(messageId, chatJid, participantJid);
+
+  if (!mediaMessage) {
+    res.status(404).json({ error: "Recent media message not found" });
+    return;
+  }
+
+  res.json({
+    message: {
+      id: mediaMessage.id,
+      chatJid: mediaMessage.chatJid,
+      senderJid: mediaMessage.senderJid,
+      pushName: mediaMessage.pushName,
+      timestamp: mediaMessage.timestamp,
+      messageType: mediaMessage.messageType,
+      durationSeconds: mediaMessage.durationSeconds,
+      mimetype: mediaMessage.mimetype,
+    },
+  });
+});
+
+app.get("/api/messages/:messageId/media", async (req: Request, res: Response) => {
+  const messageId = getSingleQueryParam(req.params.messageId);
+  const chatJid = getSingleQueryParam(req.query.chatJid);
+  const participantJid = getSingleQueryParam(req.query.participantJid);
+  if (!messageId) {
+    res.status(400).json({ error: "Missing message ID" });
+    return;
+  }
+  const mediaMessage = findRecentMediaMessage(messageId, chatJid, participantJid);
+
+  if (!mediaMessage) {
+    res.status(404).json({ error: "Recent media message not found" });
+    return;
+  }
+
+  if (!sock) {
+    res.status(503).json({ error: "WhatsApp bridge is not connected" });
+    return;
+  }
+
+  try {
+    const mediaBuffer = await downloadMediaMessage(
+      mediaMessage.rawMessage,
+      "buffer",
+      {},
+      { logger, reuploadRequest: sock.updateMediaMessage }
+    );
+
+    res.setHeader("Content-Type", mediaMessage.mimetype || "audio/ogg");
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${mediaMessage.id}.${mediaMessage.messageType === "voice_note" ? "ogg" : "bin"}"`
+    );
+    res.send(mediaBuffer);
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[bridge] Failed to download media for ${messageId}:`, errorMsg);
+    res.status(500).json({ error: `Failed to download media: ${errorMsg}` });
+  }
 });
 
 app.post("/api/send", async (req: Request, res: Response) => {
