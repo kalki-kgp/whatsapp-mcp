@@ -21,6 +21,11 @@ NEBIUS_BASE_URL = "https://api.tokenfactory.nebius.com/v1/"
 NEBIUS_API_KEY = os.environ.get("NEBIUS_API_KEY", "")
 DEFAULT_LLM_MODEL = "deepseek-ai/DeepSeek-V3-0324"
 
+# Voice-note transcription
+VOLX_BASE_URL = os.environ.get("VOLX_BASE_URL", "https://api.voxtral.life")
+VOLX_API_KEY = os.environ.get("VOLX_API_KEY", "")
+DEFAULT_VOICE_NOTE_STT_MODEL = os.environ.get("VOLX_STT_MODEL", "")
+
 # Server
 SERVER_PORT = 3009
 

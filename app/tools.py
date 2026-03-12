@@ -16,10 +16,12 @@ from app.db import (
     datetime_to_apple_ts,
     format_dt,
 )
+from app.transcription import transcribe_bridge_voice_message
 
 # LID to phone/name cache (populated on first use)
 _lid_cache: dict[str, dict] = {}
 _lid_cache_loaded = False
+RECENT_VOICE_LOOKBACK_HOURS = 72
 
 
 def _is_readable_text(text: Optional[str]) -> bool:
@@ -320,8 +322,55 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "since_minutes": {
                         "type": "integer",
-                        "description": "Get messages from the last N minutes (default 5, max 60)",
+                        "description": "Get messages from the last N minutes (default 5, max 4320 / 72 hours)",
                         "default": 5,
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "transcribe_voice_message",
+            "description": (
+                "Transcribe a recent WhatsApp voice note into text using the configured speech-to-text service. "
+                "Use this when a relevant recent message is a voice note and the user asks what someone said. "
+                "Works best with a message_id from get_incoming_messages, but can also find the latest recent voice note "
+                "by chat, sender, and time window."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "Preferred: the recent voice-note message ID returned by get_incoming_messages",
+                    },
+                    "chat_jid": {
+                        "type": "string",
+                        "description": "Optional: limit the lookup to a specific chat JID",
+                    },
+                    "participant_jid": {
+                        "type": "string",
+                        "description": "Optional: for groups, limit the lookup to a specific sender JID",
+                    },
+                    "sender_name": {
+                        "type": "string",
+                        "description": "Optional sender name to help pick the right recent voice note when no message_id is available",
+                    },
+                    "after": {
+                        "type": "string",
+                        "description": "Optional ISO 8601 datetime. Only consider recent voice notes after this time.",
+                    },
+                    "latest": {
+                        "type": "boolean",
+                        "description": "If true, transcribe the most recent matching voice note (default true)",
+                        "default": True,
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "Optional language hint for transcription, such as 'en' or 'hi'",
                     },
                 },
                 "required": [],
@@ -673,6 +722,7 @@ def get_messages(
         push_name = _clean_sender(row["ZPUSHNAME"])
         # For group messages, try group member info first
         member_name = None
+        member_jid = None
         if is_group and not row["ZISFROMME"]:
             member_jid = row["ZMEMBERJID"] if "ZMEMBERJID" in row.keys() else None
             contact_name = row["ZCONTACTNAME"] if "ZCONTACTNAME" in row.keys() else None
@@ -689,10 +739,16 @@ def get_messages(
 
         msg = {
             "time": format_dt(msg_dt),
+            "timestamp": int(msg_dt.timestamp()) if msg_dt else None,
             "sender": sender,
+            "sender_jid": None if row["ZISFROMME"] else (member_jid or row["ZFROMJID"]),
             "type": msg_type,
             "starred": bool(row["ZSTARRED"]),
         }
+        if msg_type == "voice_note":
+            msg["transcription_available"] = bool(
+                msg_dt and (datetime.now(tz=timezone.utc) - msg_dt) <= timedelta(hours=RECENT_VOICE_LOOKBACK_HOURS)
+            )
         if text and _is_readable_text(text):
             msg["text"] = text
         elif msg_type != "text":
@@ -964,6 +1020,105 @@ def get_chat_statistics(chat_jid: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Voice-note transcription helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _sender_matches_query(message: dict, sender_name: Optional[str]) -> bool:
+    if not sender_name:
+        return True
+    query = sender_name.strip().lower()
+    if not query:
+        return True
+    candidates = [
+        message.get("sender_name"),
+        message.get("pushName"),
+        _jid_to_name(message.get("senderJid")),
+        message.get("senderJid"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            normalized = candidate.strip().lower()
+            if normalized and (query in normalized or normalized in query):
+                return True
+    return False
+
+
+def _fetch_recent_bridge_messages(since_ts: int) -> list[dict]:
+    response = httpx.get(
+        f"{BRIDGE_URL}/api/incoming",
+        params={"since": max(since_ts, 0)},
+        timeout=15,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Bridge request failed with {response.status_code}")
+    payload = response.json()
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return []
+    return messages
+
+
+def _select_recent_voice_message(
+    *,
+    message_id: Optional[str] = None,
+    chat_jid: Optional[str] = None,
+    participant_jid: Optional[str] = None,
+    sender_name: Optional[str] = None,
+    after: Optional[str] = None,
+    latest: bool = True,
+) -> dict:
+    if message_id:
+        return {
+            "id": message_id,
+            "chatJid": chat_jid,
+            "senderJid": participant_jid,
+        }
+
+    after_dt = _parse_iso_datetime(after)
+    if after_dt:
+        since_ts = int(after_dt.timestamp())
+    else:
+        since_ts = int((datetime.now(tz=timezone.utc) - timedelta(hours=RECENT_VOICE_LOOKBACK_HOURS)).timestamp())
+
+    candidates = []
+    for message in _fetch_recent_bridge_messages(since_ts):
+        if message.get("messageType") != "voice_note":
+            continue
+        if chat_jid and message.get("chatJid") != chat_jid:
+            continue
+        if participant_jid and message.get("senderJid") != participant_jid:
+            continue
+        msg_ts = int(message.get("timestamp") or 0)
+        if after_dt and msg_ts < int(after_dt.timestamp()):
+            continue
+        if not _sender_matches_query(message, sender_name):
+            continue
+        candidates.append(message)
+
+    if not candidates:
+        raise RuntimeError(
+            "No recent voice note matched that chat or sender. "
+            "Try a narrower request, ask about a newer message, or check that the bridge is running."
+        )
+
+    candidates.sort(key=lambda item: int(item.get("timestamp") or 0), reverse=latest)
+    return candidates[0]
+
+
+# ---------------------------------------------------------------------------
 # Bridge tools (send messages via Baileys bridge)
 # ---------------------------------------------------------------------------
 
@@ -1020,7 +1175,7 @@ def send_message(recipient_jid: str, recipient_name: str, message: str) -> str:
 
 def get_incoming_messages(since_minutes: int = 5) -> str:
     """Get recent incoming messages from the live bridge."""
-    since_minutes = min(max(since_minutes, 1), 60)
+    since_minutes = min(max(since_minutes, 1), RECENT_VOICE_LOOKBACK_HOURS * 60)
     import time
     since_ts = int(time.time()) - (since_minutes * 60)
     try:
@@ -1032,11 +1187,78 @@ def get_incoming_messages(since_minutes: int = 5) -> str:
             msg["sender_name"] = name
             chat_name = _jid_to_name(msg.get("chatJid")) or msg.get("chatJid")
             msg["chat_name"] = chat_name
+            msg["message_id"] = msg.get("id")
         return json.dumps(data)
     except httpx.ConnectError:
         return json.dumps({"messages": [], "count": 0, "error": "Bridge not running"})
     except Exception as e:
         return json.dumps({"messages": [], "count": 0, "error": str(e)})
+
+
+def transcribe_voice_message(
+    message_id: Optional[str] = None,
+    chat_jid: Optional[str] = None,
+    participant_jid: Optional[str] = None,
+    sender_name: Optional[str] = None,
+    after: Optional[str] = None,
+    latest: bool = True,
+    language: Optional[str] = None,
+) -> str:
+    """Transcribe a recent voice note via the bridge media cache."""
+    try:
+        target = _select_recent_voice_message(
+            message_id=message_id,
+            chat_jid=chat_jid,
+            participant_jid=participant_jid,
+            sender_name=sender_name,
+            after=after,
+            latest=latest,
+        )
+        resolved_chat_jid = target.get("chatJid") or chat_jid
+        resolved_participant_jid = target.get("senderJid") or participant_jid
+        result = transcribe_bridge_voice_message(
+            target["id"],
+            chat_jid=resolved_chat_jid,
+            participant_jid=resolved_participant_jid,
+            language=language,
+        )
+
+        timestamp = result.get("timestamp")
+        msg_dt = (
+            datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            if isinstance(timestamp, (int, float))
+            else None
+        )
+        sender_jid = result.get("senderJid") or resolved_participant_jid
+        sender_display = (
+            result.get("pushName")
+            or _jid_to_name(sender_jid)
+            or sender_name
+            or sender_jid
+            or "Unknown sender"
+        )
+        chat_display = _jid_to_name(result.get("chatJid")) or result.get("chatJid")
+
+        return json.dumps(
+            {
+                "success": True,
+                "message_id": result.get("id") or target["id"],
+                "chat_jid": result.get("chatJid") or resolved_chat_jid,
+                "chat_name": chat_display,
+                "sender_jid": sender_jid,
+                "sender_name": sender_display,
+                "time": format_dt(msg_dt),
+                "message_type": result.get("messageType", "voice_note"),
+                "duration_seconds": result.get("duration_seconds") or result.get("durationSeconds"),
+                "language": result.get("language"),
+                "provider": result.get("provider"),
+                "model": result.get("model"),
+                "transcript": result.get("transcript", ""),
+                "segments": result.get("segments", []),
+            }
+        )
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
 
 
 def get_unread_summary(max_chats: int = 10, messages_per_chat: int = 5) -> str:
@@ -1235,6 +1457,7 @@ TOOL_MAP = {
     "check_whatsapp_status": check_whatsapp_status,
     "send_message": send_message,
     "get_incoming_messages": get_incoming_messages,
+    "transcribe_voice_message": transcribe_voice_message,
     "get_unread_summary": get_unread_summary,
     "schedule_message": schedule_message_tool,
     "list_scheduled_messages": list_scheduled_messages,
