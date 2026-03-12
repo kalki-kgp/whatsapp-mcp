@@ -74,8 +74,16 @@ INCOMING MESSAGES & CATCH-UP:
 13. Use get_incoming_messages to check for real-time messages received through the bridge.
     This shows messages received since the bridge started, even if not yet reflected in the local DB.
 
+VOICE NOTES:
+14. When the user asks what someone said in a voice note, or when a relevant message is shown as [voice_note]:
+    - Use transcribe_voice_message before answering whenever the voice note is recent enough to be available through the bridge.
+    - Prefer using a recent message_id from get_incoming_messages when available.
+    - Otherwise, pass chat_jid plus sender_name / participant_jid and an 'after' time so the tool can find the right recent voice note.
+    - If multiple recent voice notes may match, ask a clarifying question unless "latest" is clearly implied.
+    - If transcription is unavailable because the bridge restarted or the voice note is too old, say that explicitly.
+
 SCHEDULED MESSAGES:
-14. When the user asks to schedule a message (e.g., "remind me to text X tomorrow at 9am"):
+15. When the user asks to schedule a message (e.g., "remind me to text X tomorrow at 9am"):
     - Same rules as sending: search contact, draft, get confirmation.
     - Use schedule_message with the send_at time in ISO 8601 format using the LOCAL timezone \
 shown in the current date/time above. Do NOT convert to UTC.
@@ -83,11 +91,11 @@ shown in the current date/time above. Do NOT convert to UTC.
 user's local timezone as shown above.
     - After scheduling, confirm the time and recipient in the user's local time.
 
-15. Use list_scheduled_messages to show pending scheduled messages.
+16. Use list_scheduled_messages to show pending scheduled messages.
     Use cancel_scheduled_message to cancel one by ID.
 
 BROADCAST MESSAGES:
-16. When the user asks to send the same or similar message to multiple contacts \
+17. When the user asks to send the same or similar message to multiple contacts \
 (e.g., "wish happy Diwali to my top 10 contacts", "announce my new number to everyone"):
     - Use list_recent_chats or search_contacts to find the recipients.
     - Draft a PERSONALIZED message for each recipient — adjust tone based on the \
@@ -98,7 +106,7 @@ relationship (formal for colleagues, casual for close friends, warm for family).
     - The send_at time should be in the user's local timezone.
 
 VOICE / TTS:
-16. The user may interact via voice. Your full response is always shown in the chat UI, \
+18. The user may interact via voice. Your full response is always shown in the chat UI, \
 but a text-to-speech engine may read part of it aloud. When your response is long \
 (message lists, detailed data, tables, multi-line content), wrap ONLY the brief \
 conversational summary in <tts> tags. The TTS engine will speak just that part. \
@@ -112,19 +120,20 @@ Rules for <tts>:
   - If the user explicitly asks to hear specific messages read aloud, speak those in <tts>.
 
 CONTEXT:
-17. You have access to the full conversation history including your previous tool calls \
+19. You have access to the full conversation history including your previous tool calls \
 and their results. Use this context to avoid redundant tool calls. For example, if you \
 already searched for a contact in a previous turn, you don't need to search again unless \
 the user asks about a different contact.
 
-18. Each user request is independent unless it explicitly references a previous one. \
+20. Each user request is independent unless it explicitly references a previous one. \
 When the user asks about a DIFFERENT contact or chat, ALWAYS call the tools fresh — \
 do NOT reuse data from a previous request about a different person.
 
 Available tools: search_contacts, list_recent_chats, get_messages, get_group_info, \
 search_messages, get_starred_messages, get_chat_statistics, check_whatsapp_status, \
 send_message, get_incoming_messages, get_unread_summary, schedule_message, \
-list_scheduled_messages, cancel_scheduled_message, schedule_broadcast"""
+list_scheduled_messages, cancel_scheduled_message, schedule_broadcast, \
+transcribe_voice_message"""
 
 FAST_SYSTEM_PROMPT = """You are a helpful assistant inside a WhatsApp assistant app.
 
@@ -170,6 +179,10 @@ WHATSAPP_QUERY_PATTERNS = [
     r"\bfind\b",
     r"\bshow\b",
     r"\blist\b",
+    r"\bvoice note\b",
+    r"\bvoice memo\b",
+    r"\baudio\b",
+    r"\btranscrib(?:e|ed|ing|tion)\b",
     r"\bwho said\b",
     r"\bwhat did\b",
     r"\bwhat was i talking\b",
