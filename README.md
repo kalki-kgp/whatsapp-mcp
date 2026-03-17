@@ -1,9 +1,10 @@
 # WhatsApp MCP
 
-An AI-powered MCP (Model Context Protocol) layer for WhatsApp on macOS. Gives an LLM full tool-calling access to your WhatsApp — read messages, search contacts, send replies, schedule messages — all through a browser UI or voice.
+An AI-powered MCP (Model Context Protocol) layer for WhatsApp on macOS. Gives an LLM full tool-calling access to your WhatsApp — read messages, search contacts, send replies, schedule messages — through **any MCP-compatible AI** (Claude Desktop, Cursor, OpenAI Agents SDK, etc.), the bundled browser UI, or voice.
 
 ## Features
 
+- **Standards-compliant MCP server** — Connect from Claude Desktop, Cursor, or any MCP client via stdio
 - **Tool-calling AI** — LLM with tools to search contacts, read chats, send messages, check unread, schedule sends
 - **WhatsApp Bridge** — Connects via WhatsApp Web (Baileys) for real-time send/receive
 - **Local DB access** — Reads your macOS WhatsApp SQLite databases directly
@@ -46,23 +47,116 @@ wa uninstall      # Remove everything
 wa help           # Show all commands
 ```
 
+## MCP Server
+
+The MCP server exposes all WhatsApp capabilities as standard MCP tools, resources, and prompts. Any MCP-compatible client can connect over stdio.
+
+### Quick start
+
+```bash
+# Start the WhatsApp Bridge first (needed for send/receive)
+cd bridge && npx tsx src/server.ts &
+
+# Run the MCP server (stdio transport)
+python mcp_server.py
+```
+
+### Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "python",
+      "args": ["/path/to/whatsapp-mcp/mcp_server.py"],
+      "env": {
+        "NEBIUS_API_KEY": "your-key-here"
+      }
+    }
+  }
+}
+```
+
+### Cursor
+
+Add to `.cursor/mcp.json` in your project (or global settings):
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "python",
+      "args": ["/path/to/whatsapp-mcp/mcp_server.py"],
+      "env": {
+        "NEBIUS_API_KEY": "your-key-here"
+      }
+    }
+  }
+}
+```
+
+### Available tools
+
+| Tool | Description |
+|------|-------------|
+| `whatsapp_search_contacts` | Search contacts by name or phone number |
+| `whatsapp_list_recent_chats` | List recent chats with last message preview |
+| `whatsapp_get_messages` | Get messages from a chat with date/text filters |
+| `whatsapp_get_group_info` | Get group details and member list |
+| `whatsapp_search_messages` | Full-text search across all chats |
+| `whatsapp_get_starred_messages` | Get starred/important messages |
+| `whatsapp_get_chat_statistics` | Chat stats (counts, date range, top senders) |
+| `whatsapp_check_status` | Check bridge connection status |
+| `whatsapp_send_message` | Send a WhatsApp message |
+| `whatsapp_get_incoming_messages` | Get recent real-time incoming messages |
+| `whatsapp_transcribe_voice_message` | Transcribe a voice note to text |
+| `whatsapp_get_unread_summary` | Summary of all unread chats |
+| `whatsapp_schedule_message` | Schedule a message for future delivery |
+| `whatsapp_list_scheduled_messages` | List pending scheduled messages |
+| `whatsapp_cancel_scheduled_message` | Cancel a scheduled message |
+| `whatsapp_schedule_broadcast` | Schedule messages to multiple recipients |
+| `whatsapp_rewrite_message` | Rewrite a message with a different tone |
+
+### Resources
+
+| URI | Description |
+|-----|-------------|
+| `whatsapp://status` | Bridge connection status |
+| `whatsapp://unread` | Unread messages summary |
+| `whatsapp://scheduled` | Pending scheduled messages |
+| `whatsapp://settings` | Assistant settings |
+| `whatsapp://chats/recent` | 20 most recent chats |
+
+### Prompts
+
+| Prompt | Description |
+|--------|-------------|
+| `catch_me_up` | Summarize all unread messages |
+| `send_a_message` | Guided message-sending workflow |
+
 ## How It Works
 
 ```
-Browser UI ──→ FastAPI Server (:3009) ──→ Nebius LLM (Kimi-K2)
-                    │                          │
-                    │                    Tool calls:
-                    │                     - search_contacts
-                    │                     - get_messages
-                    │                     - send_message
-                    │                     - search_messages
-                    │                     - get_unread_summary
-                    │                     - schedule_message
-                    │                     - ...
-                    │
-                    ├──→ WhatsApp Bridge (:3010) ──→ WhatsApp Web
-                    │
-                    └──→ SQLite DBs (local WhatsApp data)
+Claude Desktop / Cursor / any MCP client
+         │
+         │ stdio (JSON-RPC)
+         ▼
+     MCP Server (mcp_server.py)
+         │
+         ├──→ WhatsApp Bridge (:3010) ──→ WhatsApp Web
+         │
+         └──→ SQLite DBs (local WhatsApp data)
+
+
+Browser UI ──→ FastAPI Server (:3009) ──→ Nebius LLM
+         │                                    │
+         │                              Tool calls
+         │
+         ├──→ WhatsApp Bridge (:3010) ──→ WhatsApp Web
+         │
+         └──→ SQLite DBs (local WhatsApp data)
 
 Voice ──→ Mic → STT → Server → LLM + Tools → TTS → Speaker
 ```
@@ -82,15 +176,17 @@ The voice mode listens for a configurable wake word (default: "hey whatsapp") an
 
 ## Requirements
 
-- macOS (Apple Silicon or Intel)
+- macOS (Apple Silicon or Intel) for local WhatsApp DB access
 - WhatsApp desktop app installed and logged in
-- [Nebius API key](https://studio.nebius.com) (for LLM)
+- [Nebius API key](https://studio.nebius.com) (for LLM and message rewriting)
+- Python 3.10+ with `mcp` package (for MCP server mode)
 
 ## Project Structure
 
 ```
 ~/.wa/                          # Installation directory
 ├── app/                        # Git clone of this repo
+│   ├── mcp_server.py           # MCP server (stdio/SSE)
 │   ├── app/                    # Python FastAPI backend
 │   │   ├── main.py             # Server + embedded UI
 │   │   ├── agent.py            # LLM agent with tool calling
