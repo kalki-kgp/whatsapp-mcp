@@ -40,35 +40,50 @@ cd whatsapp-mcp
 pip install -e .
 ```
 
-### Claude Desktop
+## Connect to Claude Desktop
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+1. Open config file:
+   ```bash
+   open ~/Library/Application\ Support/Claude/claude_desktop_config.json
+   ```
+   If it doesn't exist, create it.
+
+2. Add the WhatsApp MCP server:
+   ```json
+   {
+     "mcpServers": {
+       "whatsapp": {
+         "command": "python3",
+         "args": ["-m", "whatsapp_mcp"]
+       }
+     }
+   }
+   ```
+
+3. **Restart Claude Desktop** (Cmd+Q, then reopen)
+
+4. Look for the **MCP tools icon** (🔨) in the chat input — click it to verify "whatsapp" is listed
+
+5. Start chatting:
+   - "Show my recent WhatsApp chats"
+   - "Search messages for dinner plans"
+
+## Connect to Cursor
+
+Add to `.cursor/mcp.json` in your project:
 
 ```json
 {
   "mcpServers": {
     "whatsapp": {
-      "command": "python",
+      "command": "python3",
       "args": ["-m", "whatsapp_mcp"]
     }
   }
 }
 ```
 
-### Cursor
-
-Add to `.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "whatsapp": {
-      "command": "python",
-      "args": ["-m", "whatsapp_mcp"]
-    }
-  }
-}
-```
+Restart Cursor and use WhatsApp tools in the AI chat.
 
 ## Usage
 
@@ -129,7 +144,7 @@ Claude ──MCP──▶ WhatsApp MCP Server
 
 ```bash
 # Clone
-git clone https://github.com/anthropics/whatsapp-mcp.git
+git clone https://github.com/kalki-kgp/whatsapp-mcp.git
 cd whatsapp-mcp
 
 # Install in dev mode
@@ -137,9 +152,6 @@ pip install -e ".[dev]"
 
 # Run server
 python -m whatsapp_mcp
-
-# Run tests
-pytest
 ```
 
 ## Privacy
