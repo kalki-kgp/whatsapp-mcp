@@ -6,12 +6,12 @@
     "url": "https://github.com/kalki-kgp/whatsapp-mcp",
     "source": "github"
   },
-  "version": "0.1.0",
+  "version": "0.1.1",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "whatsapp-mcp-macos",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "transport": {
         "type": "stdio"
       },

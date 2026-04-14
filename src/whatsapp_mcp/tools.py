@@ -62,9 +62,9 @@ def search_contacts(query: str) -> str:
     try:
         conn = get_contacts_db()
         cursor = conn.execute("""
-            SELECT ZWHATSAPPID, ZFULLNAME, ZPHONENUMBER, ZPUSHNAME
-            FROM ZWACONTACT
-            WHERE ZFULLNAME LIKE ? OR ZPHONENUMBER LIKE ? OR ZPUSHNAME LIKE ?
+            SELECT ZWHATSAPPID, ZFULLNAME, ZPHONENUMBER, ZBUSINESSNAME
+            FROM ZWAADDRESSBOOKCONTACT
+            WHERE ZFULLNAME LIKE ? OR ZPHONENUMBER LIKE ? OR ZBUSINESSNAME LIKE ?
             LIMIT 20
         """, (f"%{query}%", f"%{query}%", f"%{query}%"))
 
@@ -74,7 +74,7 @@ def search_contacts(query: str) -> str:
                 continue
             results.append({
                 "jid": jid if "@" in jid else f"{jid}@s.whatsapp.net",
-                "name": row["ZFULLNAME"] or row["ZPUSHNAME"] or "Unknown",
+                "name": row["ZFULLNAME"] or row["ZBUSINESSNAME"] or "Unknown",
                 "phone": row["ZPHONENUMBER"],
             })
         conn.close()

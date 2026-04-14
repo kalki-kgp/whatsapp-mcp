@@ -2,5 +2,5 @@
 
 from whatsapp_mcp.server import mcp, main
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __all__ = ["mcp", "main"]

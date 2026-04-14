@@ -22,8 +22,13 @@ import sys
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from whatsapp_mcp.db import refresh_db
+
+# Annotations for tool hints
+READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
+WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
 from whatsapp_mcp.tools import (
     search_contacts,
     list_recent_chats,
@@ -53,7 +58,7 @@ mcp = FastMCP(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def whatsapp_status() -> str:
     """Check WhatsApp connection status.
 
@@ -88,7 +93,7 @@ def whatsapp_status() -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def whatsapp_search_contacts(query: str) -> str:
     """Search WhatsApp contacts by name or phone number.
 
@@ -102,7 +107,7 @@ def whatsapp_search_contacts(query: str) -> str:
     return search_contacts(query)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def whatsapp_list_chats(limit: int = 20, chat_type: str = "all") -> str:
     """List recent WhatsApp chats ordered by last message time.
 
@@ -114,7 +119,7 @@ def whatsapp_list_chats(limit: int = 20, chat_type: str = "all") -> str:
     return list_recent_chats(limit=limit, chat_type=chat_type)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def whatsapp_get_messages(
     chat_jid: str,
     after: Optional[str] = None,
@@ -141,7 +146,7 @@ def whatsapp_get_messages(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def whatsapp_search_messages(
     query: str,
     chat_jid: Optional[str] = None,
@@ -158,7 +163,7 @@ def whatsapp_search_messages(
     return search_messages(query=query, chat_jid=chat_jid, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def whatsapp_unread() -> str:
     """Get a summary of all unread WhatsApp messages.
 
@@ -174,7 +179,7 @@ def whatsapp_unread() -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def whatsapp_send(recipient_jid: str, message: str) -> str:
     """Send a WhatsApp message.
 
@@ -199,7 +204,7 @@ def whatsapp_send(recipient_jid: str, message: str) -> str:
     return json.dumps(result)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def whatsapp_incoming(since_minutes: int = 5) -> str:
     """Get recent incoming WhatsApp messages from the live connection.
 
