@@ -1,7 +1,7 @@
 [project]
-name = "whatsapp-mcp"
+name = "whatsapp-mcp-macos"
 version = "0.1.0"
-description = "WhatsApp MCP Server - Connect Claude to your WhatsApp"
+description = "WhatsApp MCP Server for macOS - Connect Claude to your WhatsApp"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Krishna Paikine", email = "krishnapaikine777@gmail.com" }]
@@ -27,11 +27,11 @@ dependencies = [
 dev = ["pytest", "ruff"]
 
 [project.urls]
-Homepage = "https://github.com/anthropics/whatsapp-mcp"
-Repository = "https://github.com/anthropics/whatsapp-mcp"
+Homepage = "https://github.com/kalki-kgp/whatsapp-mcp"
+Repository = "https://github.com/kalki-kgp/whatsapp-mcp"
 
 [project.scripts]
-whatsapp-mcp = "whatsapp_mcp:main"
+whatsapp-mcp-macos = "whatsapp_mcp:main"
 
 [build-system]
 requires = ["hatchling"]

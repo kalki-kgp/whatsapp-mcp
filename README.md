@@ -1,4 +1,6 @@
-# WhatsApp MCP
+# WhatsApp MCP for macOS
+
+<!-- mcp-name: io.github.kalki-kgp/whatsapp-macos -->
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server that connects Claude to your WhatsApp. Read messages, search contacts, send replies — all through natural conversation.
 
@@ -27,13 +29,13 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that connects
 ### Using pip
 
 ```bash
-pip install whatsapp-mcp
+pip install whatsapp-mcp-macos
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/anthropics/whatsapp-mcp.git
+git clone https://github.com/kalki-kgp/whatsapp-mcp.git
 cd whatsapp-mcp
 pip install -e .
 ```

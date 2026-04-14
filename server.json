@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.kalki-kgp/whatsapp-macos",
+  "description": "WhatsApp MCP Server for macOS - Read messages directly from local database, no QR needed for reading.",
+  "repository": {
+    "url": "https://github.com/kalki-kgp/whatsapp-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "whatsapp-mcp-macos",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": []
+    }
+  ]
+}

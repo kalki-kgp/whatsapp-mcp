@@ -48,3 +48,4 @@ htmlcov/
 # Temp
 *.log
 /tmp/
+.mcpregistry_*
