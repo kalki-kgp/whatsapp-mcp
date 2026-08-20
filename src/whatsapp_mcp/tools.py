@@ -34,6 +34,43 @@ MESSAGE_TYPES = {
 }
 
 
+# ZWAMESSAGE.ZPUSHNAME holds encoded Core Data blobs, not readable names, so
+# sender names come from the profile push-name table instead. In groups the
+# sender is ZGROUPMEMBER (ZFROMJID is the group itself); in DMs it's ZFROMJID.
+SENDER_JOINS = """
+            LEFT JOIN ZWAGROUPMEMBER gm ON gm.Z_PK = m.ZGROUPMEMBER
+            LEFT JOIN ZWAPROFILEPUSHNAME gpn ON gpn.ZJID = gm.ZMEMBERJID
+            LEFT JOIN ZWAPROFILEPUSHNAME fpn ON fpn.ZJID = m.ZFROMJID
+"""
+
+SENDER_COLUMNS = """
+                gm.ZMEMBERJID as member_jid,
+                gm.ZCONTACTNAME as member_name,
+                gpn.ZPUSHNAME as group_push_name,
+                fpn.ZPUSHNAME as from_push_name,
+"""
+
+
+def _resolve_sender(row, partner_name: Optional[str] = None) -> str:
+    """Best readable name for a message's sender."""
+    if row["is_from_me"]:
+        return "You"
+    for key in ("group_push_name", "member_name", "from_push_name"):
+        if row[key]:
+            return row[key]
+    # DMs: the chat partner is the sender
+    if partner_name:
+        return partner_name
+    return row["member_jid"] or row["from_jid"] or "Unknown"
+
+
+def _sender_jid(row) -> Optional[str]:
+    """The sender's own JID - for groups that's the member, not the group."""
+    if row["is_from_me"]:
+        return None
+    return row["member_jid"] or row["from_jid"]
+
+
 def _parse_iso_datetime(dt_str: Optional[str]) -> Optional[datetime]:
     """Parse an ISO 8601 datetime string."""
     if not dt_str:
@@ -101,8 +138,10 @@ def list_recent_chats(limit: int = 20, chat_type: str = "all") -> str:
                 cs.ZPARTNERNAME as name,
                 cs.ZLASTMESSAGEDATE as last_msg_date,
                 cs.ZUNREADCOUNT as unread,
-                cs.ZLASTMESSAGETEXT as last_msg
+                m.ZTEXT as last_msg,
+                m.ZMESSAGETYPE as last_msg_type
             FROM ZWACHATSESSION cs
+            LEFT JOIN ZWAMESSAGE m ON m.Z_PK = cs.ZLASTMESSAGE
             WHERE cs.ZCONTACTJID IS NOT NULL
             ORDER BY cs.ZLASTMESSAGEDATE DESC
             LIMIT ?
@@ -121,12 +160,22 @@ def list_recent_chats(limit: int = 20, chat_type: str = "all") -> str:
                 continue
 
             last_dt = apple_ts_to_datetime(row["last_msg_date"])
+
+            # Media messages carry no text - label them by type instead
+            last_msg = row["last_msg"] or ""
+            if not last_msg and row["last_msg_type"] is not None:
+                last_type = MESSAGE_TYPES.get(
+                    row["last_msg_type"], f"type_{row['last_msg_type']}"
+                )
+                if last_type != "text":
+                    last_msg = f"[{last_type}]"
+
             chats.append({
                 "jid": jid,
                 "name": row["name"] or "Unknown",
                 "type": "group" if is_group else "dm",
                 "unread_count": row["unread"] or 0,
-                "last_message": (row["last_msg"] or "")[:100],
+                "last_message": last_msg[:100],
                 "last_message_time": format_dt(last_dt),
             })
 
@@ -170,6 +219,8 @@ def get_messages(
             SELECT ZPARTNERNAME FROM ZWACHATSESSION WHERE ZCONTACTJID = ?
         """, (chat_jid,)).fetchone()
         chat_name = session["ZPARTNERNAME"] if session else "Unknown"
+        # In a group, ZPARTNERNAME is the group name - not a usable sender name
+        dm_partner = None if chat_jid.endswith("@g.us") else chat_name
 
         # Get messages
         query = """
@@ -179,10 +230,11 @@ def get_messages(
                 m.ZMESSAGETYPE as msg_type,
                 m.ZFROMJID as from_jid,
                 m.ZISFROMME as is_from_me,
-                m.ZPUSHNAME as push_name,
+""" + SENDER_COLUMNS + """
                 m.ZSTARRED as starred
             FROM ZWAMESSAGE m
             JOIN ZWACHATSESSION cs ON m.ZCHATSESSION = cs.Z_PK
+""" + SENDER_JOINS + """
             WHERE cs.ZCONTACTJID = ?
               AND m.ZMESSAGEDATE >= ?
               AND m.ZMESSAGEDATE <= ?
@@ -211,8 +263,8 @@ def get_messages(
             messages.append({
                 "time": format_dt(msg_dt),
                 "timestamp": int(msg_dt.timestamp()) if msg_dt else 0,
-                "sender": "You" if row["is_from_me"] else (row["push_name"] or row["from_jid"] or "Unknown"),
-                "sender_jid": None if row["is_from_me"] else row["from_jid"],
+                "sender": _resolve_sender(row, dm_partner),
+                "sender_jid": _sender_jid(row),
                 "type": msg_type,
                 "starred": bool(row["starred"]),
                 "text": text,
@@ -257,11 +309,12 @@ def search_messages(query: str, chat_jid: Optional[str] = None, limit: int = 20)
                 m.ZTEXT as text,
                 m.ZFROMJID as from_jid,
                 m.ZISFROMME as is_from_me,
-                m.ZPUSHNAME as push_name,
+""" + SENDER_COLUMNS + """
                 cs.ZCONTACTJID as chat_jid,
                 cs.ZPARTNERNAME as chat_name
             FROM ZWAMESSAGE m
             JOIN ZWACHATSESSION cs ON m.ZCHATSESSION = cs.Z_PK
+""" + SENDER_JOINS + """
             WHERE m.ZTEXT LIKE ?
         """
         params = [f"%{query}%"]
@@ -282,7 +335,10 @@ def search_messages(query: str, chat_jid: Optional[str] = None, limit: int = 20)
                 "chat_jid": row["chat_jid"],
                 "chat_name": row["chat_name"] or "Unknown",
                 "time": format_dt(msg_dt),
-                "sender": "You" if row["is_from_me"] else (row["push_name"] or "Unknown"),
+                "sender": _resolve_sender(
+                    row,
+                    None if (row["chat_jid"] or "").endswith("@g.us") else row["chat_name"],
+                ),
                 "text": row["text"],
             })
 
@@ -323,10 +379,13 @@ def get_unread_summary(max_chats: int = 10, messages_per_chat: int = 5) -> str:
                 SELECT
                     m.ZMESSAGEDATE as msg_date,
                     m.ZTEXT as text,
-                    m.ZPUSHNAME as push_name,
-                    m.ZISFROMME as is_from_me
+                    m.ZMESSAGETYPE as msg_type,
+                    m.ZFROMJID as from_jid,
+                    m.ZISFROMME as is_from_me,
+""" + SENDER_COLUMNS.rstrip().rstrip(",") + """
                 FROM ZWAMESSAGE m
                 JOIN ZWACHATSESSION cs ON m.ZCHATSESSION = cs.Z_PK
+""" + SENDER_JOINS + """
                 WHERE cs.ZCONTACTJID = ?
                 ORDER BY m.ZMESSAGEDATE DESC
                 LIMIT ?
@@ -335,10 +394,20 @@ def get_unread_summary(max_chats: int = 10, messages_per_chat: int = 5) -> str:
             messages = []
             for msg in msg_cursor:
                 msg_dt = apple_ts_to_datetime(msg["msg_date"])
+                text = msg["text"] or ""
+                if not text and msg["msg_type"] is not None:
+                    msg_type = MESSAGE_TYPES.get(
+                        msg["msg_type"], f"type_{msg['msg_type']}"
+                    )
+                    if msg_type != "text":
+                        text = f"[{msg_type}]"
+
                 messages.append({
                     "time": format_dt(msg_dt),
-                    "sender": "You" if msg["is_from_me"] else (msg["push_name"] or "Unknown"),
-                    "text": (msg["text"] or "")[:200],
+                    "sender": _resolve_sender(
+                        msg, None if jid.endswith("@g.us") else row["name"]
+                    ),
+                    "text": text[:200],
                 })
 
             chats.append({
