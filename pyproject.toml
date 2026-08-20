@@ -1,6 +1,6 @@
 [project]
 name = "whatsapp-mcp-macos"
-version = "0.1.1"
+version = "0.1.2"
 description = "WhatsApp MCP Server for macOS - Connect Claude to your WhatsApp"
 readme = "README.md"
 license = { text = "MIT" }
@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",
     "httpx>=0.27.0",
 ]
 

@@ -2,7 +2,9 @@
 
 <!-- mcp-name: io.github.kalki-kgp/whatsapp-macos -->
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server that connects Claude to your WhatsApp. Read messages, search contacts, send replies — all through natural conversation.
+A [Model Context Protocol](https://modelcontextprotocol.io) server that connects Claude to your WhatsApp. Ask Claude to catch you up on unread chats, search your message history, or send a reply.
+
+Reading works in about a minute with no QR scan and no Node.js. Sending is optional and needs one extra step.
 
 <p align="center">
   <img src="https://img.shields.io/badge/platform-macOS-blue" alt="macOS">
@@ -12,32 +14,31 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that connects
 
 ## Features
 
-- **Search contacts** — Find anyone by name or phone number
-- **Read messages** — Get chat history with date filtering and search
-- **List chats** — See recent conversations with unread counts
-- **Send messages** — Reply directly through Claude (with QR authentication)
-- **Real-time incoming** — Get messages as they arrive
+Search contacts by name or phone number. Read chat history with date filtering. List recent conversations with unread counts. Summarize everything you haven't read yet. Send replies and receive incoming messages once the bridge is connected.
 
 ## Requirements
 
-- **macOS** with WhatsApp desktop app installed and logged in
-- **Python 3.10+**
-- **Node.js 18+** (for sending messages)
+- macOS with the WhatsApp desktop app installed and logged in
+- Node.js 18+, only if you want to send messages
+
+You don't need to install Python. `uvx` fetches a suitable version on its own.
 
 ## Installation
 
-### Using pip
+Install [uv](https://docs.astral.sh/uv/) if you don't have it:
 
 ```bash
-pip install whatsapp-mcp-macos
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+That's the whole install. `uvx` downloads the server on first launch, so there's no virtualenv to create and no `pip install` step. Go to the next section to point Claude at it.
 
 ### From source
 
 ```bash
 git clone https://github.com/kalki-kgp/whatsapp-mcp.git
 cd whatsapp-mcp
-pip install -e .
+uv venv && uv pip install -e .
 ```
 
 ## Connect to Claude Desktop
@@ -48,23 +49,30 @@ pip install -e .
    ```
    If it doesn't exist, create it.
 
-2. Add the WhatsApp MCP server:
+2. Find the full path to `uvx`:
+   ```bash
+   which uvx
+   ```
+
+3. Add the WhatsApp MCP server, pasting that path as the command:
    ```json
    {
      "mcpServers": {
        "whatsapp": {
-         "command": "python3",
-         "args": ["-m", "whatsapp_mcp"]
+         "command": "/Users/YOU/.local/bin/uvx",
+         "args": ["whatsapp-mcp-macos"]
        }
      }
    }
    ```
 
-3. **Restart Claude Desktop** (Cmd+Q, then reopen)
+   Use the absolute path, not bare `uvx`. Claude Desktop starts with a minimal PATH that doesn't include `~/.local/bin`, so a bare command name is the most common reason the server never appears.
 
-4. Look for the **MCP tools icon** (🔨) in the chat input — click it to verify "whatsapp" is listed
+4. Restart Claude Desktop with Cmd+Q, then reopen. Closing the window is not enough.
 
-5. Start chatting:
+5. Click the MCP tools icon in the chat input and check that "whatsapp" is listed.
+
+6. Start chatting:
    - "Show my recent WhatsApp chats"
    - "Search messages for dinner plans"
 
@@ -76,8 +84,8 @@ Add to `.cursor/mcp.json` in your project:
 {
   "mcpServers": {
     "whatsapp": {
-      "command": "python3",
-      "args": ["-m", "whatsapp_mcp"]
+      "command": "/Users/YOU/.local/bin/uvx",
+      "args": ["whatsapp-mcp-macos"]
     }
   }
 }
@@ -136,7 +144,7 @@ Claude ──MCP──▶ WhatsApp MCP Server
                             (for sending)
 ```
 
-**Read operations** query the local WhatsApp database directly — fast and works offline.
+Read operations query the local WhatsApp database directly, so they work offline and need no bridge.
 
 **Send operations** go through the bridge, which connects to WhatsApp Web using [Baileys](https://github.com/WhiskeySockets/Baileys).
 
@@ -156,7 +164,7 @@ python -m whatsapp_mcp
 
 ## Privacy
 
-- All data stays local — messages are read from your own WhatsApp database
+- All data stays local. The server reads messages from your own WhatsApp database
 - No data is sent to external servers (except WhatsApp Web when sending)
 - The MCP server runs locally on your machine
 

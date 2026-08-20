@@ -409,6 +409,14 @@ def get_incoming_messages(since_minutes: int = 5) -> dict:
     since_ts = int((datetime.now(tz=timezone.utc) - timedelta(minutes=since_minutes)).timestamp())
 
     try:
+        status = httpx.get(f"{BRIDGE_URL}/api/status", timeout=5).json()
+        if status.get("status") != "connected":
+            return {
+                "messages": [],
+                "error": f"Bridge is {status.get('status', 'unavailable')}, not connected. "
+                         "Incoming messages are unavailable until it reconnects.",
+            }
+
         resp = httpx.get(
             f"{BRIDGE_URL}/api/incoming",
             params={"since": since_ts},
