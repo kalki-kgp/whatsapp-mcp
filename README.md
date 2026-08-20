@@ -1,3 +1,5 @@
+Check it out on https://mcp.paperknife.app/
+
 # WhatsApp MCP for macOS
 
 <!-- mcp-name: io.github.kalki-kgp/whatsapp-macos -->
