@@ -1,0 +1,59 @@
+{
+  "manifest_version": "0.4",
+  "name": "whatsapp-mcp",
+  "display_name": "WhatsApp MCP for macOS",
+  "version": "0.1.3",
+  "description": "Connect Claude to your WhatsApp. Search contacts, read chat history, and send replies — all local on your Mac.",
+  "long_description": "WhatsApp MCP for macOS reads messages from your local WhatsApp database, so they never leave your machine. Search contacts, list recent chats, read message history, and catch up on unread messages — no QR scan, no Node.js, no Python install. Sending is optional: when you want the model to send replies, start the included WhatsApp Web bridge and scan one QR code.",
+  "author": {
+    "name": "Krishna Paikine",
+    "url": "https://github.com/kalki-kgp"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kalki-kgp/whatsapp-mcp.git"
+  },
+  "homepage": "https://mcp.paperknife.app/",
+  "documentation": "https://github.com/kalki-kgp/whatsapp-mcp#readme",
+  "support": "https://github.com/kalki-kgp/whatsapp-mcp/issues",
+  "server": {
+    "type": "uv",
+    "entry_point": "src/whatsapp_mcp/__main__.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--directory", "${__dirname}", "-m", "whatsapp_mcp"],
+      "env": {
+        "WHATSAPP_BRIDGE_URL": "${user_config.whatsapp_bridge_url}"
+      }
+    }
+  },
+  "tools": [
+    { "name": "whatsapp_status", "description": "Check WhatsApp connection status. Returns a QR code if one is needed for sending." },
+    { "name": "whatsapp_search_contacts", "description": "Search WhatsApp contacts by name or phone number." },
+    { "name": "whatsapp_list_chats", "description": "List recent WhatsApp chats ordered by last message time, with unread counts." },
+    { "name": "whatsapp_get_messages", "description": "Get messages from a specific chat, filtered by date range." },
+    { "name": "whatsapp_search_messages", "description": "Full-text search across all WhatsApp message history." },
+    { "name": "whatsapp_unread", "description": "Summary of all unread WhatsApp messages, grouped by chat." },
+    { "name": "whatsapp_send", "description": "Send a WhatsApp message. Requires the bridge to be connected." },
+    { "name": "whatsapp_incoming", "description": "Get recent incoming WhatsApp messages from the live connection." }
+  ],
+  "tools_generated": false,
+  "keywords": ["whatsapp", "mcp", "claude", "messages", "macos", "local", "privacy"],
+  "license": "MIT",
+  "privacy_policies": ["https://mcp.paperknife.app/#privacy"],
+  "compatibility": {
+    "platforms": ["darwin"],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  },
+  "user_config": {
+    "whatsapp_bridge_url": {
+      "type": "string",
+      "title": "WhatsApp Bridge URL",
+      "description": "URL of the WhatsApp Web bridge, only needed for sending messages. Defaults to http://localhost:3010.",
+      "default": "http://localhost:3010",
+      "required": false
+    }
+  }
+}

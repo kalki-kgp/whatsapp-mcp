@@ -1,0 +1,31 @@
+# MCPB bundle exclusions — keep only the Python read server.
+# uv type resolves deps from pyproject.toml; no venv/lib bundling.
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# VCS & repo metadata
+.git/
+.gitignore
+.github/
+.DS_Store
+
+# Node bridge (separate distribution; contains auth_info)
+bridge/
+
+# MCP registry descriptor (different format, not part of MCPB)
+server.json
+
+# uv lock (host resolves from pyproject.toml)
+uv.lock
+
+# Local secrets — must never ship
+.mcpregistry_*
+
+# Logs
+*.log

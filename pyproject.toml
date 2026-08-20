@@ -1,6 +1,6 @@
 [project]
 name = "whatsapp-mcp-macos"
-version = "0.1.2"
+version = "0.1.3"
 description = "WhatsApp MCP Server for macOS - Connect Claude to your WhatsApp"
 readme = "README.md"
 license = { text = "MIT" }
